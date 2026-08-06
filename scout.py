@@ -633,6 +633,11 @@ _ANALYSIS_DEFAULTS = {
     # opens; locator_missing flags a campaign we couldn't locate so the clipper can fail loud
     # on it instead of silently proceeding. Never crashes on a miss.
     "campaign_id": None, "locator_missing": False, "brief_url": None, "frame_url": None,
+    # Full on-modal capture (rules live in DIFFERENT places per campaign): the dialog's visible
+    # requirements/guidelines text, ALL resource anchors (rules docs AND footage folders, each
+    # labelled), and the on-modal stats. The clipper reads rules from BOTH the on-modal text
+    # AND the linked docs, whichever a campaign uses.
+    "modal_requirements_text": None, "resource_links": [], "modal_stats": None,
 }
 
 
@@ -706,6 +711,9 @@ def build_record(card, detail, status):
     rec["campaign_id"] = detail.get("campaign_id") or extract.campaign_id_from_url(rec["url"])
     rec["brief_url"] = detail.get("brief_url")
     rec["frame_url"] = detail.get("frame_url")
+    rec["modal_requirements_text"] = detail.get("modal_requirements_text")
+    rec["resource_links"] = detail.get("resource_links") or []
+    rec["modal_stats"] = detail.get("modal_stats")
     rec["locator_missing"] = not (rec["url"] or rec["campaign_id"])
     return rec
 
@@ -974,48 +982,152 @@ def _campaign_uuid_from_frame(frame_url):
     return seg if _UUID_RE.fullmatch(seg or "") else None
 
 
-def _brief_url_from_dialog(dialog):
-    """The campaign's brief link straight off the open dialog — the <a> whose text contains
-    'Brief' (the live dump showed 'Google DriveBrief' -> a Google Doc URL). This is the brief
-    SOURCE the clipper's intake consumes, captured navigation-free. External (Google) URLs are
-    returned as-is; a relative whop href is absolutized. None if absent. Never raises."""
-    try:
-        locs = dialog.locator("a")
-        count = locs.count()
-    except Exception:
-        return None
-    for i in range(min(count, 40)):
-        try:
-            a = locs.nth(i)
-            text = (a.text_content() or "").strip().lower()
-            href = a.get_attribute("href")
-        except Exception:
+# Rule/requirement docs + footage folders link out to these hosts. Captured in FULL (not just
+# a "Brief" anchor) because campaigns label them differently — Brief / Requirements / Guidelines
+# / Content — and some (DoorDash) have TWO (a rules doc AND a footage folder).
+_RESOURCE_HOST_RE = re.compile(
+    r"(docs\.google\.com|drive\.google\.com|sheets\.google\.com|slides\.google\.com|"
+    r"notion\.so|notion\.site|dropbox\.com|onedrive\.live\.com|1drv\.ms|mega\.nz)", re.I)
+
+
+def _dedupe_doubled(s):
+    """Anchor text often renders the label twice (icon span + label span both carry it, e.g.
+    'Clips & GuidelinesClips & Guidelines'). Collapse an exact immediate doubling — but only
+    for non-trivial lengths, so a real word like 'ByeBye' isn't mangled."""
+    n = len(s)
+    if n >= 8 and n % 2 == 0 and s[:n // 2] == s[n // 2:]:
+        return s[:n // 2]
+    return s
+
+
+def _clean_anchor_label(text):
+    """A readable resource label: collapse whitespace, drop the leading service icon-word the
+    anchor renders ('Google DriveBrief' -> 'Brief'), and undo the doubled-text artifact."""
+    s = _dedupe_doubled(" ".join((text or "").split()))
+    s = re.sub(r"^(Google Drive|Google Docs|Google Sheets|Google Slides|Google|Notion|"
+               r"Dropbox|Drive|Docs|Sheets)\s*", "", s, flags=re.I).strip()
+    return _dedupe_doubled(s) or "link"
+
+
+def _resource_links_from_anchors(anchors):
+    """ALL doc/drive/notion resource anchors in the dialog as [{url, label}], deduped by url,
+    order preserved. Not filtered by the word 'Brief' — every rules doc AND footage folder."""
+    out, seen = [], set()
+    for a in anchors or []:
+        href = (a.get("href") or "").strip()
+        if not href or href in seen:
             continue
-        if href and "brief" in text:
-            return href if href.startswith("http") else (_abs_whop_url(href) or href)
-    return None
+        if not _RESOURCE_HOST_RE.search(href):
+            continue
+        seen.add(href)
+        out.append({"url": href, "label": _clean_anchor_label(a.get("text"))})
+    return out
+
+
+def _pick_brief_url(resource_links):
+    """A single convenience 'brief' link (back-compat): prefer a rules-doc label, else the
+    first resource. None if there are no resources."""
+    if not resource_links:
+        return None
+    for r in resource_links:
+        lab = (r.get("label") or "").lower()
+        if any(k in lab for k in ("brief", "requirement", "guideline", "rule", "doc")):
+            return r.get("url")
+    return resource_links[0].get("url")
+
+
+def _money(s):
+    try:
+        return float((s or "").replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _parse_modal_stats(text):
+    """On-modal stats (no doc needed): pay rate, budget paid/total/remaining, min payout, max
+    per video — parsed from the dialog's visible text. Also keeps the raw 'Earnings' snippet
+    for eyeballing. Best-effort; any field absent -> omitted. Never raises. The dialog renders
+    these as '$248,632 /$250,000' (paid/total), '$1.50 /1K' (rate), '$1.50 Min', '$1500 Max'."""
+    if not text:
+        return None
+    t = " ".join(text.split())
+    st = {}
+    m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*/\s*1\s*[kK]", t)
+    if m:
+        st["pay_per_1k"] = _money(m.group(1))
+        st["pay_rate_text"] = m.group(0).strip()
+    m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*/\s*\$\s*([\d,]+(?:\.\d+)?)", t)
+    if m:
+        paid, total = _money(m.group(1)), _money(m.group(2))
+        st["budget_paid"], st["budget_total"] = paid, total
+        st["budget_remaining_fraction"] = (
+            max(0.0, min(1.0, 1.0 - paid / total)) if (paid is not None and total) else None)
+    m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*Min\b", t)
+    if m:
+        st["min_payout"] = _money(m.group(1))
+    m = re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*Max\b", t)
+    if m:
+        st["max_per_video"] = _money(m.group(1))
+    em = re.search(r"\bEarnings\b(.*?)(?:\bAnalytics\b|\bResources\b|$)", t, re.S)
+    if em and em.group(1).strip():
+        st["earnings_text"] = em.group(1).strip()[:300]
+    return st or None
+
+
+# Runs inside the app frame against the OPEN dialog. Returns the frame's client route
+# (location.href — where the campaign UUID lives), the dialog's full visible innerText (the
+# on-modal requirements/guidelines the clipper needs when there's no linked doc), and EVERY
+# anchor (href + visible label) so all resource links are captured, not just one.
+_MODAL_EXTRACT_JS = r"""
+() => {
+  const d = document.querySelector('[role="dialog"]')
+        || document.querySelector('.campaign-details-modal-bg');
+  const out = {frameUrl: location.href, found: !!d};
+  if (!d) return out;
+  out.requirementsText = (d.innerText || d.textContent || '').trim();
+  out.anchors = [...d.querySelectorAll('a')].map(a => ({
+    href: a.getAttribute('href') || a.href || '',
+    text: (a.innerText || a.textContent || '').trim().slice(0, 120)
+  })).filter(a => a.href);
+  return out;
+}
+"""
 
 
 def _capture_locator(page, fl, list_page_url):
-    """Read the campaign locator from the OPEN detail modal — the PRIMARY, navigation-free
-    path (confirmed via --test-capture live diagnostics). Sources:
-      - campaign_id: the UUID in the app-frame route (`_campaign_uuid_from_frame`).
-      - url: the human-clickable whop.com campaign URL built from the shared app id + that
-        UUID (`https://whop.com/discover/app/<app_id>/<UUID>`). `frame_url` keeps the raw
-        apps.whop.com route as the confirmed-canonical fallback for verification.
-      - brief_url: the dialog's 'Brief' anchor (Google Doc/Drive), for intake.
-    Every field degrades to None; never raises. locator_missing (set in build_record) is True
-    only when we got NEITHER a url nor a campaign_id."""
-    frame_url = _frame_url(page)
+    """Read EVERYTHING the clipper needs from the OPEN detail modal — the PRIMARY, navigation-
+    free path (confirmed via --test-capture). One frame.evaluate pulls the frame route, the
+    dialog's full visible text, and all anchors; the rest is parsed here:
+      - campaign_id: the UUID in the app-frame route (identity only; the built whop.com URL
+        does NOT resolve — it lands on Discover — so `url` is left None on purpose).
+      - modal_requirements_text: the dialog's visible body (description + on-modal
+        requirements/guidelines) so intake has the on-page rules even with no linked doc.
+      - resource_links: ALL doc/drive/notion anchors as {url, label} (rules docs AND footage
+        folders; some campaigns have both), labelled so intake/clipper can tell them apart.
+      - modal_stats: pay rate, budget, min/max payout parsed from the modal text.
+      - brief_url: a single convenience rules-doc link (back-compat).
+    Every field degrades to None/[]; never raises. locator_missing (build_record) is True only
+    when we captured NEITHER a campaign_id nor a url."""
+    data = {}
+    fr = get_app_frame(page)
+    if fr is not None:
+        try:
+            data = fr.evaluate(_MODAL_EXTRACT_JS) or {}
+        except Exception:
+            data = {}
+    frame_url = data.get("frameUrl") or _frame_url(page)
     campaign_id = _campaign_uuid_from_frame(frame_url)
-    url = f"https://whop.com/discover/app/{_app_id()}/{campaign_id}" if campaign_id else None
-    brief_url = None
-    try:
-        brief_url = _brief_url_from_dialog(fl.locator(S.DETAIL_DIALOG[0]).first)
-    except Exception:
-        pass
-    return {"campaign_id": campaign_id, "url": url,
-            "frame_url": frame_url, "brief_url": brief_url}
+    requirements = (data.get("requirementsText") or "").strip() or None
+    resource_links = _resource_links_from_anchors(data.get("anchors"))
+    return {
+        "campaign_id": campaign_id,
+        "url": None,                       # UUID url doesn't resolve — identity only
+        "frame_url": frame_url,
+        "modal_requirements_text": requirements,
+        "resource_links": resource_links,
+        "modal_stats": _parse_modal_stats(requirements),
+        "brief_url": _pick_brief_url(resource_links),
+    }
 
 
 # Set True by the --test-capture diagnostic to make capture_campaign_url narrate each tier.
@@ -1186,10 +1298,11 @@ def scrape_detail(page, fl, name, list_page_url, pacer, cfg):
         # PRIMARY: the app-frame route carries the campaign UUID once the modal is open
         # (confirmed via --test-capture). Navigation-free and reliable — also grabs brief_url.
         loc = _capture_locator(page, fl, list_page_url)
-        # Fallback for a human-clickable url ONLY when the frame yielded no UUID (rare): the
-        # old anchor/expand tiers. We skip them otherwise so the fragile expand-and-return
-        # navigation never runs on the happy path.
-        if not loc.get("url"):
+        # The frame-UUID is the locator; the built whop.com URL doesn't resolve, so `url` is
+        # deliberately None. Only when the UUID ITSELF is missing (rare) do we fall back to the
+        # old anchor/expand url tiers — so the fragile expand-and-return navigation never runs
+        # on the happy path.
+        if not loc.get("campaign_id"):
             url, _list_ok = capture_campaign_url(page, fl, list_page_url, pacer, cfg)
             loc["url"] = url
     finally:
@@ -1200,6 +1313,9 @@ def scrape_detail(page, fl, name, list_page_url, pacer, cfg):
     detail["campaign_id"] = loc.get("campaign_id")
     detail["brief_url"] = loc.get("brief_url")
     detail["frame_url"] = loc.get("frame_url")
+    detail["modal_requirements_text"] = loc.get("modal_requirements_text")
+    detail["resource_links"] = loc.get("resource_links") or []
+    detail["modal_stats"] = loc.get("modal_stats")
     return detail
 
 
@@ -1507,19 +1623,30 @@ def run_test_capture(session, pacer, cfg, n):
         loc = {}
         try:
             loc = _capture_locator(page, fl, list_page_url)
-            if not loc.get("url"):
+            if not loc.get("campaign_id"):
                 url, _list_ok = capture_campaign_url(page, fl, list_page_url, pacer, cfg)
                 loc["url"] = url
         except Exception as e:
             print(f"      locator capture raised: {type(e).__name__}: {e}")
-        rec = build_record(c, {"url": loc.get("url"), "campaign_id": loc.get("campaign_id"),
-                               "brief_url": loc.get("brief_url"),
-                               "frame_url": loc.get("frame_url")}, status="scraped")
-        print(f"      => campaign_id={rec.get('campaign_id')!r}")
-        print(f"         url        ={rec.get('url')!r}")
+        rec = build_record(c, dict(loc), status="scraped")
+        req = (rec.get("modal_requirements_text") or "").replace("\n", " ")
+        req = " ".join(req.split())
+        stats = rec.get("modal_stats") or {}
+        print(f"      => campaign_id={rec.get('campaign_id')!r}  locator_missing={rec.get('locator_missing')}")
         print(f"         frame_url  ={rec.get('frame_url')!r}")
-        print(f"         brief_url  ={rec.get('brief_url')!r}")
-        print(f"         locator_missing={rec.get('locator_missing')}")
+        print(f"         modal_requirements_text[:200]: {req[:200]!r}"
+              f"  (len={len(rec.get('modal_requirements_text') or '')})")
+        rls = rec.get("resource_links") or []
+        print(f"         resource_links ({len(rls)}):")
+        for r in rls:
+            print(f"            [{r.get('label')}] {r.get('url')}")
+        if stats:
+            print(f"         modal_stats: pay/1k={stats.get('pay_per_1k')} "
+                  f"budget={stats.get('budget_paid')}/{stats.get('budget_total')} "
+                  f"(rem {stats.get('budget_remaining_fraction')}) "
+                  f"min_payout={stats.get('min_payout')} max/video={stats.get('max_per_video')}")
+        else:
+            print("         modal_stats: (none parsed)")
 
         try:
             close_detail(page, fl)
@@ -1539,20 +1666,22 @@ def run_test_capture(session, pacer, cfg, n):
 
     print("\n== locator-capture summary ==")
     got = sum(1 for r in records if r.get("campaign_id"))
-    got_brief = sum(1 for r in records if r.get("brief_url"))
+    got_req = sum(1 for r in records if r.get("modal_requirements_text"))
+    got_res = sum(1 for r in records if r.get("resource_links"))
     missing = sum(1 for r in records if r.get("locator_missing"))
     for r in records:
         flag = "MISSING" if r.get("locator_missing") else "ok"
-        print(f"  [{flag:^7}] {(r.get('name') or '?')[:34]:34}  "
-              f"id={r.get('campaign_id') or '-'}")
-        print(f"            url  ={r.get('url') or '(none)'}")
-        print(f"            brief={r.get('brief_url') or '(none)'}")
+        rls = r.get("resource_links") or []
+        labels = ", ".join(f"{x.get('label')}" for x in rls) or "-"
+        print(f"  [{flag:^7}] {(r.get('name') or '?')[:34]:34}  id={r.get('campaign_id') or '-'}  "
+              f"req={'Y' if r.get('modal_requirements_text') else 'n'}  "
+              f"links={len(rls)} [{labels}]")
     print(f"\n  {got}/{len(records)} captured a campaign_id (UUID); "
-          f"{got_brief}/{len(records)} captured a brief_url; {missing} locator_missing.")
-    print("  NOTE: `url` is built as https://whop.com/discover/app/<app_id>/<UUID>; `frame_url`\n"
-          "  is the raw apps.whop.com route the campaign actually loaded. If the built url\n"
-          "  doesn't open the campaign directly in a browser, the frame_url is canonical —\n"
-          "  tell me which resolves and I'll store that one.")
+          f"{got_req}/{len(records)} captured on-modal requirements text; "
+          f"{got_res}/{len(records)} captured resource link(s); {missing} locator_missing.")
+    print("  NOTE: campaign_id (UUID) is an IDENTIFIER only — the whop.com/<app>/<UUID> url does\n"
+          "  NOT resolve (lands on Discover), so `url` is left None. The clipper reads rules from\n"
+          "  BOTH modal_requirements_text AND the resource_links (rules docs + footage folders).")
     print(f"  Wrote {out} — the real campaigns.json was NOT touched.")
     print(f"  Per-campaign dialog HTML dumped to probe_capture_1..{len(records)}.html.")
 
