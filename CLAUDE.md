@@ -224,6 +224,21 @@ Key module responsibilities:
   never-raise. `probe_campaigns` runs before the social/footage/clipper passes and can add
   the `footage_inaccessible` disqualifier. See the "Footage SUBSTANCE" note above. Also a
   standalone CLI: `python intake.py <source_url> ...`.
+
+**Rules readability + Notion exclusion (`resolve_rules_readability`).** The clipper's intake
+can read on-modal rules and Google Docs but NOT Notion pages (JS-rendered). Clipping a campaign
+whose banned-word list is unknown is a compliance risk, so scout resolves per campaign WHERE the
+rules are readable from: `modal` (substantive on-page requirements — `_modal_rules_section` +
+`_has_substantive_rules`, which ignore pointer-only sections like "Refer to the Google Docs"),
+`gdoc` (a `docs.google.com` resource link — intake reads it), or, ONLY when rules live solely in
+Notion, it fetches that public page over HTTP (`_fetch_notion_text`: `__NEXT_DATA__` + visible
+text + meta; needs ≥400 usable chars) → `notion` (stored as `notion_rules_text`) or, on
+failure, `rules_unreadable=True` with a reason. **rules_unreadable campaigns are EXCLUDED from
+the ranked/active output** (`report` segregates them into an "Excluded — rules unreadable"
+section; `pickcampaign.rank_campaigns` skips them) but kept in `campaigns.json`. Notion that is
+merely REDUNDANT (real rules also on-modal or in a Doc) never drops a campaign. Runs in `main`
+after `enrich_active`; only the only-in-Notion cases hit the network. `--test-capture` prints
+each campaign's `rules_source`.
 - **`proven_clips.py`** — answers "is THIS creator repeatably clippable?" via
   DEDICATED CLIPPER-ACCOUNT IDENTITY, fully automatically (no human confirmation). It
   (1) DISCOVERS clipper accounts by searching **YouTube** (`yt-dlp ytsearch`, primary;

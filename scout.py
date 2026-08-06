@@ -638,6 +638,12 @@ _ANALYSIS_DEFAULTS = {
     # labelled), and the on-modal stats. The clipper reads rules from BOTH the on-modal text
     # AND the linked docs, whichever a campaign uses.
     "modal_requirements_text": None, "resource_links": [], "modal_stats": None,
+    # Rules readability (Notion handling). rules_source: modal/gdoc/notion/unreadable/none;
+    # rules_unreadable=True (rules ONLY in a source we can't read) EXCLUDES the campaign from
+    # the ranked output the clipper reads. notion_rules_text holds a successfully-fetched
+    # public Notion page's rules.
+    "rules_readable": None, "rules_source": None, "rules_unreadable": False,
+    "rules_unreadable_reason": None, "notion_rules_text": None,
 }
 
 
@@ -1128,6 +1134,191 @@ def _capture_locator(page, fl, list_page_url):
         "modal_stats": _parse_modal_stats(requirements),
         "brief_url": _pick_brief_url(resource_links),
     }
+
+
+# --- rules readability (Notion fetch + exclusion) ------------------------------
+# The clipper's intake can read on-modal text and Google Docs, but NOT Notion pages
+# (JS-rendered). A campaign whose rules live ONLY in an unreadable source must not reach the
+# clipper — clipping without the known banned-word list is a compliance-violation risk. So
+# scout resolves rules readability here: prefer on-modal / Google-Doc rules; only when rules
+# are ONLY in Notion does it try to fetch that page over HTTP; if that fails, the campaign is
+# flagged rules_unreadable and EXCLUDED from the ranked output (kept in campaigns.json,
+# segregated with a reason). Notion being present but REDUNDANT (real rules also on-modal or
+# in a Doc) is never a reason to drop a campaign.
+
+# A requirements section that only POINTS elsewhere ("Refer to the Google Docs…", "Guidelines
+# on content links") carries no actual rules — strip these before judging substance.
+_RULES_POINTER_PHRASES = (
+    "refer to the google docs", "refer to the google doc", "refer to google docs",
+    "refer to google doc", "refer to the doc", "refer to the docs", "refer to the brief",
+    "refer to the resources", "refer to resources", "see the google doc", "see the doc",
+    "see the requirements doc", "see below", "see resources", "guidelines on content links",
+    "guidelines on the content links", "guidelines on content", "content requirements",
+    "in the google doc", "in the doc below", "link below", "links below",
+    "for the campaign requirements", "for the requirements", "campaign requirements",
+)
+# Words that betray REAL rules even in a short section.
+_RULE_SIGNAL_RE = re.compile(
+    r"\b(must|required|do not|don'?t|banned|prohibited|watermark|caption|hashtag|on-?screen|"
+    r"audience|tier|provided footage|no outside|comment|mention|disclosure|geo|min |max )"
+    r"|#\w|\d+%", re.I)
+
+
+def _modal_rules_section(modal_text):
+    """The requirements/guidelines section of the modal text (between 'Content Requirements'
+    and the Earnings/Analytics/Resources blocks), or '' if none."""
+    if not modal_text:
+        return ""
+    t = " ".join(modal_text.split())
+    m = re.search(r"Content Requirements(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)",
+                  t, re.I | re.S) or re.search(
+        r"\bRequirements\b(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)", t, re.I | re.S)
+    return (m.group(1).strip() if m else "")
+
+
+def _has_substantive_rules(text):
+    """True if `text` carries actual rules (not just a pointer to a doc). Substance = enough
+    words left after removing pointer phrases, OR any concrete rule-signal keyword."""
+    if not text or not text.strip():
+        return False
+    low = text.lower()
+    for p in _RULES_POINTER_PHRASES:
+        low = low.replace(p, " ")
+    words = re.findall(r"[a-z0-9%+$#]+", low)
+    return len(words) >= 6 or bool(_RULE_SIGNAL_RE.search(text))
+
+
+def _rules_gdoc_links(resource_links):
+    return [r for r in (resource_links or [])
+            if re.search(r"docs\.google\.com", r.get("url") or "", re.I)]
+
+
+def _rules_notion_links(resource_links):
+    return [r for r in (resource_links or [])
+            if re.search(r"notion\.so|notion\.site", r.get("url") or "", re.I)]
+
+
+def _next_data_text(raw):
+    """Human-readable strings from a Next.js __NEXT_DATA__ blob (Notion super-sites embed the
+    page content there). '' if absent/unparseable."""
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', raw, re.S)
+    if not m:
+        return ""
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return ""
+    out = []
+
+    def walk(o):
+        if isinstance(o, str):
+            s = o.strip()
+            if len(s) >= 3 and " " in s and not s.startswith(("http", "/", "{", "[", "data:")):
+                out.append(s)
+        elif isinstance(o, dict):
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+    walk(data)
+    return " ".join(dict.fromkeys(out))
+
+
+def _html_visible_text(raw):
+    raw = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", raw, flags=re.I | re.S)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    import html as _html
+    return " ".join(_html.unescape(raw).split())
+
+
+def _meta_description(raw):
+    m = re.search(r'<meta[^>]+(?:name|property)=["\'](?:og:description|description)["\']'
+                  r'[^>]*content=["\']([^"\']+)', raw, re.I)
+    return m.group(1) if m else ""
+
+
+def _fetch_notion_text(url, timeout=20):
+    """Best-effort fetch of a PUBLIC Notion page's rules text over plain HTTP. Returns
+    (text, source) on success or (None, reason) on failure — private/gated/JS-only pages that
+    expose no readable content fail here (and the campaign is then excluded). Never raises."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return None, f"fetch failed: {(str(e).splitlines() or ['?'])[0]}"
+    text = " ".join(p for p in (_next_data_text(raw), _html_visible_text(raw),
+                                _meta_description(raw)) if p)
+    text = " ".join(text.split())
+    low = text.lower()
+    if not text or len(text) < 400 or "enable javascript" in low:
+        return None, f"no usable rules text ({len(text)} chars — JS-only/gated/private)"
+    return text[:8000], "notion-http"
+
+
+def resolve_rules_readability(rec, fetch=True):
+    """Decide where a campaign's rules are readable FROM, and flag it rules_unreadable when
+    they are ONLY in a source we can't read (Notion that won't fetch). Sets: rules_source
+    (modal/gdoc/notion/unreadable/none), rules_readable (bool), rules_unreadable (bool) +
+    rules_unreadable_reason, and notion_rules_text when a Notion fetch succeeds. Only fetches
+    Notion for the ONLY-in-Notion case (never a broad crawl). Never raises."""
+    rec.setdefault("notion_rules_text", None)
+    resource_links = rec.get("resource_links") or []
+    section = _modal_rules_section(rec.get("modal_requirements_text") or "")
+    has_modal = _has_substantive_rules(section) or _has_substantive_rules(rec.get("rules_text"))
+    gdocs = _rules_gdoc_links(resource_links)
+    notions = _rules_notion_links(resource_links)
+
+    def _set(source, readable, unreadable, reason):
+        rec["rules_source"] = source
+        rec["rules_readable"] = readable
+        rec["rules_unreadable"] = unreadable
+        rec["rules_unreadable_reason"] = reason
+
+    if has_modal:
+        _set("modal", True, False, None)
+    elif gdocs:
+        _set("gdoc", True, False, None)          # intake reads Google Docs fine
+    elif notions:
+        text, why = (None, "not fetched")
+        if fetch:
+            try:
+                text, why = _fetch_notion_text(notions[0].get("url"))
+            except Exception as e:               # belt-and-suspenders; _fetch already guards
+                text, why = None, f"fetch error: {type(e).__name__}"
+        if text:
+            rec["notion_rules_text"] = text
+            _set("notion", True, False, None)
+        else:
+            _set("unreadable", False, True,
+                 f"rules only in Notion ({notions[0].get('url')}) — {why}")
+    else:
+        # No readable rules source AND no unreadable one either — out of scope for this
+        # Notion feature; leave it in the board (don't newly exclude), just record the gap.
+        _set("none", False, False, None)
+    return rec
+
+
+def resolve_rules_readability_all(records, fetch=True):
+    """Run rules-readability resolution over every scraped/refreshed record. Logs how many are
+    excluded (rules only in an unreadable Notion source)."""
+    active = [r for r in records if r.get("status") in ("scraped", "refreshed")]
+    excluded = []
+    for r in active:
+        resolve_rules_readability(r, fetch=fetch)
+        if r.get("rules_unreadable"):
+            excluded.append(r)
+    if excluded:
+        print(f"  Rules readability: {len(excluded)} campaign(s) EXCLUDED — rules only in an "
+              f"unreadable source (Notion). They stay in campaigns.json, flagged, but are not "
+              f"ranked/handed to the clipper:")
+        for r in excluded:
+            print(f"    - {r.get('name')!r}: {r.get('rules_unreadable_reason')}")
+    return excluded
 
 
 # Set True by the --test-capture diagnostic to make capture_campaign_url narrate each tier.
@@ -1629,6 +1820,7 @@ def run_test_capture(session, pacer, cfg, n):
         except Exception as e:
             print(f"      locator capture raised: {type(e).__name__}: {e}")
         rec = build_record(c, dict(loc), status="scraped")
+        resolve_rules_readability(rec, fetch=True)   # incl. a Notion fetch if that's the only source
         req = (rec.get("modal_requirements_text") or "").replace("\n", " ")
         req = " ".join(req.split())
         stats = rec.get("modal_stats") or {}
@@ -1647,6 +1839,11 @@ def run_test_capture(session, pacer, cfg, n):
                   f"min_payout={stats.get('min_payout')} max/video={stats.get('max_per_video')}")
         else:
             print("         modal_stats: (none parsed)")
+        rr = "READABLE" if rec.get("rules_readable") else ("UNREADABLE" if rec.get("rules_unreadable") else "no-rules")
+        print(f"         rules: {rr} (source={rec.get('rules_source')})"
+              + (f"  notion_rules_text len={len(rec.get('notion_rules_text') or '')}"
+                 if rec.get("rules_source") == "notion" else "")
+              + (f"  reason={rec.get('rules_unreadable_reason')}" if rec.get("rules_unreadable") else ""))
 
         try:
             close_detail(page, fl)
@@ -1668,17 +1865,20 @@ def run_test_capture(session, pacer, cfg, n):
     got = sum(1 for r in records if r.get("campaign_id"))
     got_req = sum(1 for r in records if r.get("modal_requirements_text"))
     got_res = sum(1 for r in records if r.get("resource_links"))
+    unreadable = sum(1 for r in records if r.get("rules_unreadable"))
     missing = sum(1 for r in records if r.get("locator_missing"))
     for r in records:
         flag = "MISSING" if r.get("locator_missing") else "ok"
         rls = r.get("resource_links") or []
         labels = ", ".join(f"{x.get('label')}" for x in rls) or "-"
-        print(f"  [{flag:^7}] {(r.get('name') or '?')[:34]:34}  id={r.get('campaign_id') or '-'}  "
-              f"req={'Y' if r.get('modal_requirements_text') else 'n'}  "
-              f"links={len(rls)} [{labels}]")
+        rr = "UNREADABLE" if r.get("rules_unreadable") else (r.get("rules_source") or "?")
+        print(f"  [{flag:^7}] {(r.get('name') or '?')[:30]:30}  id={r.get('campaign_id') or '-'}  "
+              f"rules={rr:<10} links={len(rls)} [{labels}]")
     print(f"\n  {got}/{len(records)} captured a campaign_id (UUID); "
-          f"{got_req}/{len(records)} captured on-modal requirements text; "
-          f"{got_res}/{len(records)} captured resource link(s); {missing} locator_missing.")
+          f"{got_req}/{len(records)} on-modal requirements; {got_res}/{len(records)} resource "
+          f"link(s); {unreadable} EXCLUDED (rules unreadable); {missing} locator_missing.")
+    print("  rules source per campaign: modal (on-page) / gdoc (Google Doc) / notion (fetched "
+          "OK) / unreadable (Notion-only, not fetchable -> EXCLUDED) / no-rules.")
     print("  NOTE: campaign_id (UUID) is an IDENTIFIER only — the whop.com/<app>/<UUID> url does\n"
           "  NOT resolve (lands on Discover), so `url` is left None. The clipper reads rules from\n"
           "  BOTH modal_requirements_text AND the resource_links (rules docs + footage folders).")
@@ -1786,6 +1986,10 @@ def main():
             for rec in results:
                 enrich_active(rec, cfg, prev_rec=prev_by_id.get(rec.get("id")))
                 rec["pre_score"] = pre_score(rec)
+            # RULES READABILITY — resolve where each campaign's rules are readable from and
+            # fetch Notion when it's the ONLY source; campaigns whose rules can't be read are
+            # flagged rules_unreadable and excluded from the ranked output (report + clipper).
+            resolve_rules_readability_all(results)
             # FOOTAGE SUBSTANCE INTAKE — runs FIRST (accessibility is a hard disqualifier,
             # so an undownloadable-footage campaign is sunk before we spend effort on it).
             # Judges what I'd actually be clipping, not just the stats. Cached per campaign.

@@ -256,7 +256,11 @@ def _coverage_md(active):
 
 def write_summary_md(path, campaigns):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
-    active = [c for c in scored if not c.get("disqualified")]
+    # rules_unreadable campaigns (rules only in an unreadable Notion source) are EXCLUDED from
+    # the ranked/active set — the clipper must never receive a campaign whose banned-words are
+    # unknown — but kept and shown in their own section with the reason.
+    unreadable = [c for c in scored if c.get("rules_unreadable") and not c.get("disqualified")]
+    active = [c for c in scored if not c.get("disqualified") and not c.get("rules_unreadable")]
     disqualified = [c for c in scored if c.get("disqualified")]
     # Rank by composite; ties break toward the better-UNDERSTOOD campaign (more core
     # signals known), then the crude pre_score.
@@ -269,7 +273,8 @@ def write_summary_md(path, campaigns):
              f"Generated {datetime.now(timezone.utc).isoformat()}", ""]
     lines.append(
         f"{len(active)} rankable · {len(disqualified)} disqualified · "
-        f"{len(skipped)} pre-filtered · {len(completed)} clipper-done.")
+        f"{len(unreadable)} rules-unreadable · {len(skipped)} pre-filtered · "
+        f"{len(completed)} clipper-done.")
     lines.append("")
     lines.append("Sorted by composite rank (reach x rate drives it; expected $/clip and "
                  "proven clippability are the heavy levers). Campaigns ranking mostly on "
@@ -316,6 +321,21 @@ def write_summary_md(path, campaigns):
             lines.append(f"- {name} — {reasons}")
         lines.append("")
 
+    # --- excluded: rules unreadable ---------------------------------------------
+    if unreadable:
+        unreadable.sort(key=lambda c: c.get("name") or "")
+        lines.append("## Excluded — rules unreadable (NOT ranked, NOT handed to the clipper)")
+        lines.append("")
+        lines.append("Rules live ONLY in a source scout/intake can't read (a Notion page that "
+                     "didn't fetch). Clipping without the known banned-word list is a compliance "
+                     "risk, so these are held out of the ranking. Fix by adding an on-page / "
+                     "Google-Doc rules source, or verify the page is public.")
+        lines.append("")
+        for c in unreadable:
+            name = c.get("name") or "(unnamed)"
+            lines.append(f"- {name} — {c.get('rules_unreadable_reason') or 'rules unreadable'}")
+        lines.append("")
+
     # --- skipped by pre-filter --------------------------------------------------
     if skipped:
         lines.append("## Skipped by pre-filter")
@@ -344,7 +364,8 @@ def write_summary_md(path, campaigns):
 
 def terminal_report(campaigns, *, db_total, new_count, failures):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
-    active = [c for c in scored if not c.get("disqualified")]
+    unreadable = [c for c in scored if c.get("rules_unreadable") and not c.get("disqualified")]
+    active = [c for c in scored if not c.get("disqualified") and not c.get("rules_unreadable")]
     disqualified = [c for c in scored if c.get("disqualified")]
     newly_scraped = sum(1 for c in scored if c.get("status") == "scraped")
     refreshed = sum(1 for c in scored if c.get("status") == "refreshed")
@@ -361,6 +382,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
     print("=" * 72)
     print(f"  Rankable campaigns this run          : {len(active)}")
     print(f"  Disqualified (sunk, still shown)     : {len(disqualified)}")
+    print(f"  Excluded — rules unreadable (Notion) : {len(unreadable)}")
     print(f"  Total campaigns in DB                : {db_total}")
     print(f"  Scraped this run (unreached)         : {newly_scraped} ({new_count} never-seen)")
     print(f"  Known, refreshed no re-scrape        : {refreshed}")
