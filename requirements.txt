@@ -1,0 +1,2 @@
+playwright>=1.44
+yt-dlp>=2024.4.9

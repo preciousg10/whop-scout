@@ -1,0 +1,28 @@
+# Logged-in browser profile — NEVER commit this (it contains your session).
+whop_profile/
+
+# Runtime outputs
+campaigns.json
+campaigns_test.json
+campaigns_summary.md
+campaign_template.json
+proven_clips_result.json
+proven_clips_cache.json
+state.json
+errors.log
+probe_*.png
+probe_*.html
+probe_*.json
+
+# Personal state (clipper/user-maintained; scout reads it, never a template)
+completed_campaigns.json
+
+# Personal user-maintained input (my own recorded results / seed accounts) — not source
+my_performance.json
+clip_farms.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

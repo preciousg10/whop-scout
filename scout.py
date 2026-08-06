@@ -1,0 +1,1703 @@
+"""Scout — a personal Whop Content Rewards research tool.
+
+Runs standalone from a terminal:  python scout.py
+It drives *your own* logged-in, visible Chromium at human pace, once a day, and
+degrades to "not today, browse manually" the moment anything looks like a block.
+See README.md for the full flow. No Claude involvement at runtime.
+
+Flags:
+  --force     ignore the once-daily (20h) guard
+  --refresh   full re-scrape of every campaign, not just new ones (delta is default)
+  --probe     log in, screenshot + dump a card and a detail page to confirm selectors
+"""
+import argparse
+import json
+import random
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Campaign names carry emoji ("🔥 $5K Budget"); a Windows console defaults to cp1252 and
+# UnicodeEncodeErrors the moment we print one (a latent crash that killed runs on emoji
+# campaigns). Force UTF-8 on stdout/stderr the same way the clipper's common.py does. All
+# FILE I/O in this project already passes encoding="utf-8"; this closes the console gap.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import extract
+import footage as footage_mod
+import intake as intake_mod
+import proven_clips as clips_mod
+import report
+import selectors as S
+import social as social_mod
+import strategic as strategic_mod
+import scoring
+from browser import Session
+from pacing import Pacer
+from scoring import composite_score, pre_score
+from state import State
+
+
+# =============================================================================
+# CONFIG — every tunable lives here. Edit these defaults to taste.
+# (Selectors are their own concern; they live in selectors.py.)
+# =============================================================================
+@dataclass(frozen=True)
+class Config:
+    # session / browser
+    profile_dir: str = "./whop_profile"       # persistent login profile
+    viewport: tuple = (1366, 768)             # normal desktop window
+
+    # once-daily + session caps
+    min_hours_between_runs: float = 20.0      # refuse if last run < this (unless --force)
+    max_campaigns: int = 200                  # per-run detail cap
+    max_minutes: float = 90.0                 # per-run wall-clock cap
+
+    # click / interaction resilience — Whop's cross-origin iframe UI is frequently SLOWER
+    # than a single click timeout, and most "failures" are transient slowness, not real
+    # blocks. So: generous timeouts, retry slow clicks, and a high consecutive-failure
+    # tripwire that only trips on a genuine block (captcha/login wall raise StopRun directly).
+    click_timeout_ms: int = 28000             # card + dialog click timeout (was 8000)
+    dialog_wait_ms: int = 15000               # wait for the detail dialog to render (was 8000)
+    scroll_into_view_ms: int = 8000           # scroll a card into view before clicking
+    click_retries: int = 3                    # attempts per click before it counts as a failure
+    click_retry_wait: tuple = (1.5, 3.5)      # short random wait between click retries
+    max_consecutive_failures: int = 8         # run-ending tripwire (real block, not slowness)
+
+    # human pacing (seconds unless noted)
+    base_delay: tuple = (1.5, 6.0)            # normal per-page think time
+    fast_delay: tuple = (0.3, 0.8)            # fast click-through
+    fast_chance: float = 0.20                 # 20% of delays are fast
+    afk_every: tuple = (6, 15)                # campaigns between AFK breaks
+    afk_break: tuple = (45, 150)              # AFK break length
+    long_afk_chance: float = 0.10             # 10% of breaks are long
+    long_afk_break: tuple = (180, 300)        # 3–5 min long break
+    revisit_chance: float = 0.05              # 5% double-back to previous
+    scroll_step: tuple = (300, 800)           # px per wheel tick
+    scroll_pause: tuple = (0.5, 1.5)          # s between wheel ticks
+    list_stable_rounds: int = 3               # scroll rounds w/ no new cards = "end"
+
+    # pre-filter — a CHEAP gate that only spares session/browser budget on UNREACHED
+    # campaigns that are genuinely unusable. It must NOT do the ranking's job: the composite
+    # weighs pay-rate-vs-reach-vs-earnings tradeoffs, so a low headline rate on a huge,
+    # clippable creator is a KEEP, not a drop. Floors are deliberately near "absurd" (e.g.
+    # $0.01/1k, empty budget), not "unattractive". Known campaigns bypass this entirely
+    # (see prefilter()). Applied only to values we actually parsed — nothing invisible.
+    prefilter_min_pay_per_1k: float = 0.25    # $/1k floor (catch absurd rates only); 0 disables
+    prefilter_min_budget_remaining: float = 0.05   # must be strictly greater (near-empty only)
+    prefilter_required_platforms: tuple = ("tiktok", "shorts", "reels")
+
+    # scoring / footage
+    footage_top_n: int = 30                   # probe this many top campaigns
+    social_top_n: int = 30                    # source-popularity lookup on this many
+
+    # proven-clips / repeatable-clippability (the heavy new ranking lever).
+    # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
+    # creator (YouTube-primary), not the creator's own channel — see proven_clips.py.
+    # footage substance intake (intake.py)
+    cookies_from_browser: str = None          # e.g. "chrome" — lets yt-dlp reach gated VODs (Kick)
+    max_snapshot_history: int = 20            # per-run snapshots kept for cross-run projections
+    my_performance_path: str = "my_performance.json"  # my recorded results (learning hook)
+    clips_analyze_all: bool = True            # analyze EVERY VIABLE survivor (not a top-N)
+    clips_top_n: int = 40                     # cap when clips_analyze_all is False (top by pre_score)
+    # Only analyze survivors that clear a lightweight VIABILITY floor — budget still
+    # remaining AND not flagged below-minimum-payout — so the expensive clipper discovery
+    # isn't spent on clearly-marginal campaigns (they keep clippability UNKNOWN/neutral and
+    # are still ranked). Set False to restore full-coverage analysis of every non-DQ survivor.
+    clips_viability_floor: bool = True
+    # Analysis-phase performance. The off-Whop yt-dlp pass is uncapped and hits YouTube (not
+    # Whop), so it is safe to parallelize and needs no human pacing. Creator results are
+    # cached across runs (recurring creators are never re-fetched within the TTL).
+    clips_workers: int = 4                    # parallel yt-dlp creator lookups (small pool)
+    clips_campaign_timeout_s: int = 300       # per-creator wall-clock cap (one stall can't hang the phase)
+    clips_cache_path: str = "proven_clips_cache.json"  # cross-run creator -> clippability cache
+    clips_cache_max_age_days: int = 14        # reuse a SCORED creator result this long
+    clips_cache_unknown_age_days: int = 3     # retry an UNKNOWN/failed creator sooner
+    clipper_search_n: int = 20                # ytsearch depth per discovery query
+    clipper_max_accounts: int = 8             # candidate clipper channels to harvest (cost cap)
+    clipper_trust_threshold: float = 0.5      # legitimacy score to auto-trust a clipper
+    clipper_min_for_high: int = 2             # >= this many trusted clippers -> eligible HIGH
+    clipper_strong_single_clips: int = 10     # ...or one clipper with >= this many clips
+    clips_per_creator: int = 40               # recent videos to pull per channel (flat)
+    clips_enrich_top: int = 12                # enrich this many pooled clips w/ full metadata
+    clips_relative_multiple: float = 5.0      # elite bar: clip views >= N× the clipper's followers
+    clips_template_clips: int = 15            # top-N clips the template patterns draw from
+
+    # minimum-payout viability: a campaign whose first payout needs more than this
+    # many views (min_payout / pay_per_1k * 1000) is flagged HIGH_MINIMUM and
+    # deprioritized hard — a normal ~1k-view clip would earn nothing.
+    min_payout_max_views: float = 1000.0
+
+    # output paths
+    state_path: str = "state.json"
+    campaigns_path: str = "campaigns.json"
+    summary_path: str = "campaigns_summary.md"
+    errors_path: str = "errors.log"
+    template_path: str = "campaign_template.json"   # winning-clip patterns (for the clipper)
+    clip_farms_path: str = "clip_farms.json"        # optional known clip-farm accounts
+    # DONE list — campaigns the CLIPPER has actually processed/exhausted. The clipper writes
+    # this (or use --mark-done); ONLY these are skipped from future scraping AND ranking.
+    # "Already scraped" is NOT done — a scraped campaign stays a ranked candidate until here.
+    completed_path: str = "completed_campaigns.json"
+
+
+CONFIG = Config()
+
+
+# =============================================================================
+class StopRun(Exception):
+    """Raised to abort the whole run immediately (challenge / repeated failures)."""
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log_error(path, url, exc):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{_now_iso()}\t{url}\t{type(exc).__name__}: {exc}\n")
+
+
+def safe_goto(page, url, *, wait_until="domcontentloaded", timeout=30000):
+    """Navigate without ever raising.
+
+    Manual login triggers Whop's own OAuth redirect chain; a programmatic goto that
+    collides with it raises "Navigation interrupted by another navigation" (or
+    ERR_ABORTED). None of that should be able to kill a run. Returns True if the
+    navigation settled, False otherwise.
+    """
+    try:
+        page.goto(url, wait_until=wait_until, timeout=timeout)
+        return True
+    except Exception as e:
+        first_line = (str(e).splitlines() or [type(e).__name__])[0]
+        print(f"    (navigation to {url} didn't settle: {first_line})")
+        return False
+
+
+# --- frame + selector helpers --------------------------------------------------
+# The cards live inside a cross-origin app iframe (apps.whop.com). "scope" below is
+# whatever we run selectors against — the app Frame in practice, the page as a
+# fallback. Frame and Page share the .locator/.content/.url interface.
+def pick_card_selector(scope):
+    """The CARD candidate that currently matches the most elements in `scope`."""
+    best, best_n = None, 0
+    for sel in S.CARD:
+        try:
+            n = scope.locator(sel).count()
+        except Exception:
+            n = 0
+        if n > best_n:
+            best, best_n = sel, n
+    return best, best_n
+
+
+def get_app_frame_locator(page):
+    """A FrameLocator for the Content Rewards app iframe. Used for ALL list
+    queries/scrolling/clicks: it re-resolves the frame lazily on every call, so it
+    survives the app re-rendering (unlike a captured Frame object). Returns None if
+    the iframe element isn't present yet."""
+    for sel in S.APP_IFRAME:
+        try:
+            if page.locator(sel).first.count() > 0:
+                return page.frame_locator(sel)
+        except Exception:
+            continue
+    return None
+
+
+def get_app_frame(page, timeout=20):
+    """Wait for and return the app iframe's Frame OBJECT (apps.whop.com). Used only
+    where we need `.content()` (the probe dump) or `.url` (detail navigation
+    tracking) — things a FrameLocator can't give. For querying elements, prefer
+    get_app_frame_locator."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for fr in page.frames:
+            try:
+                if fr is not page.main_frame and S.APP_FRAME_URL_HINT in (fr.url or ""):
+                    return fr
+            except Exception:
+                continue
+        time.sleep(1.0)
+    return None
+
+
+def _iframe_box(page):
+    for sel in S.APP_IFRAME:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                box = loc.bounding_box()
+                if box:
+                    return box
+        except Exception:
+            continue
+    return None
+
+
+def scroll_list(page, pacer, steps=None):
+    """Human wheel-scroll INSIDE the app iframe (cursor parked over it), so the
+    frame's own feed scrolls rather than the top page. Real wheel events, no JS."""
+    steps = steps if steps is not None else random.randint(2, 5)
+    box = _iframe_box(page)
+    for _ in range(steps):
+        try:
+            if box:
+                page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            page.mouse.wheel(0, random.randint(*pacer.scroll_step))
+        except Exception:
+            pass
+        time.sleep(random.uniform(*pacer.scroll_pause))
+
+
+def wait_for_feed(page, pacer, timeout=40, min_anchors=30):
+    """The list is a client-rendered app inside a cross-origin iframe. Wait for that
+    iframe, then poll INSIDE it (via a FrameLocator) until its campaign feed renders.
+
+    Returns the app FrameLocator (whether or not cards were detected, so callers can
+    still query/dump), or None if the iframe element never appeared. Selector-
+    agnostic readiness: a CARD candidate matching several elements, or the frame's
+    anchor count growing past baseline and stabilizing.
+    """
+    try:
+        page.wait_for_load_state("networkidle", timeout=8000)
+    except Exception:
+        pass
+    # Scroll the top page down so the app iframe mounts past the hero and is in view.
+    pacer.human_scroll(page, steps=4)
+
+    # Wait for the iframe element itself to exist, then build a FrameLocator.
+    fl_deadline = time.monotonic() + 20
+    fl = None
+    while time.monotonic() < fl_deadline:
+        fl = get_app_frame_locator(page)
+        if fl is not None:
+            break
+        time.sleep(1.0)
+    if fl is None:
+        print("    app iframe (apps.whop.com) not found yet.")
+        return None
+
+    deadline = time.monotonic() + timeout
+    last, stable = -1, 0
+    while time.monotonic() < deadline:
+        sel, n = pick_card_selector(fl)
+        if sel and n >= 3:
+            return fl
+        try:
+            anchors = fl.locator("a").count()
+        except Exception:
+            anchors = 0
+        if anchors >= min_anchors and anchors == last:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        last = anchors
+        scroll_list(page, pacer, steps=2)
+        time.sleep(1.2)
+    return fl
+
+
+def _app_id():
+    m = re.search(r"(app_[A-Za-z0-9]+)", S.LIST_URL)
+    return m.group(1) if m else ""
+
+
+def _on_content_rewards(page):
+    app_id = _app_id().lower()
+    return bool(app_id and app_id in (page.url or "").lower())
+
+
+def _find_banner(page):
+    for sel in S.DISCOVER_BANNER:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def navigate_to_list(page, pacer):
+    """Reach the Content Rewards app the way a user would: open /discover/, then
+    CLICK the Clipping/Content Rewards banner. A direct goto to the app URL gets
+    bounced back to /discover/ by Whop's client router, so clicking is the reliable
+    path — the direct goto is only a fallback. Never raises. Returns True if we end
+    up on the content-rewards app page.
+    """
+    if _on_content_rewards(page):
+        return True
+
+    # Preferred path: discover page, then click the banner.
+    if safe_goto(page, S.DISCOVER_URL):
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        banner = _find_banner(page)
+        if banner is not None:
+            pacer.maybe_hover(banner)
+            pacer.page_delay()
+            try:
+                banner.click(timeout=5000)
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                time.sleep(1.0)
+            except Exception as e:
+                first = (str(e).splitlines() or ["?"])[0]
+                print(f"    (banner click didn't take: {first})")
+        else:
+            print("    (couldn't find the Content Rewards banner on /discover/)")
+
+    # Fallback: a direct goto (may be bounced, but worth one try).
+    if not _on_content_rewards(page):
+        print("    falling back to direct navigation to the app URL...")
+        safe_goto(page, S.LIST_URL)
+    return _on_content_rewards(page)
+
+
+# --- login ---------------------------------------------------------------------
+# Nothing in this phase may ever crash the run. We never navigate programmatically
+# while the user is mid-login (that's what collides with the OAuth redirect); we
+# only navigate *after* their Enter, and even then via safe_goto with retries.
+def _manual_login_prompt():
+    print("\n" + "-" * 60)
+    print("Log in manually in the browser window (email / Google / whatever).")
+    print("Take all the time you need — Scout will NOT navigate while you do.")
+    print("When you're fully logged in, come back here and press Enter.")
+    print("(Scout never touches your credentials or automates the login form.)")
+    print("-" * 60)
+    input("Press Enter once logged in... ")
+
+
+def _reach_list_or_wait(page, pacer):
+    """Get to the Content Rewards list after login by clicking through /discover/.
+    Retry a few times; if it still isn't reachable, show what we see and wait for
+    another Enter — never exit."""
+    while True:
+        for attempt in range(1, 4):
+            navigate_to_list(page, pacer)
+            time.sleep(1.0)
+            if not extract.is_login_wall(page) and _on_content_rewards(page):
+                return
+            print(f"    list not reachable yet (attempt {attempt}/3)...")
+            time.sleep(2)
+        print("\nCouldn't reach the Content Rewards list after 3 tries.")
+        print(f"  Current URL : {page.url}")
+        print(f"  Login wall? : {extract.is_login_wall(page)}")
+        print("Finish logging in or navigate there manually, then press Enter to retry.")
+        input("Press Enter to retry (or Ctrl+C to quit)... ")
+
+
+def ensure_logged_in(session, first_run, pacer, always_prompt=False):
+    page = session.page
+
+    # always_prompt (used by --probe): never trust the login-wall heuristic — the
+    # whole point of a probe is to dump the *logged-in* DOM, and the persistent
+    # profile makes first_run False after the very first launch even when we're not
+    # actually logged in. So force the manual flow every probe.
+    if first_run or always_prompt:
+        # Open a benign page and then get out of the way. No goto to the list until
+        # the user has finished logging in and pressed Enter.
+        safe_goto(page, "https://whop.com/")
+        _manual_login_prompt()
+        _reach_list_or_wait(page, pacer)
+        return
+
+    # Returning session: click through to the list once. If we're logged out, fall
+    # back to the same manual flow — still never exiting.
+    navigate_to_list(page, pacer)
+    time.sleep(1.0)
+    if not extract.is_login_wall(page) and _on_content_rewards(page):
+        return
+    _manual_login_prompt()
+    _reach_list_or_wait(page, pacer)
+
+
+# --- probe ---------------------------------------------------------------------
+def run_probe(session, pacer):
+    # The final "press Enter to close" pause must ALWAYS fire — including the
+    # no-cards-matched early return and any mid-probe error — or a fast probe closes
+    # the window instantly and can kill the logged-in session. Hence try/finally.
+    try:
+        _probe_body(session, pacer)
+    finally:
+        print("\nProbe done. probe_list.html / probe_detail.html + the PNGs are saved.")
+        print("Send them to Claude to fix selectors.py, then run `python scout.py`.")
+        input("\nPress Enter to close the browser... ")
+
+
+def _probe_body(session, pacer):
+    page = session.page
+    print("\nProbe: opening Discover and clicking through to Content Rewards...")
+    on_list = navigate_to_list(page, pacer)
+    print(f"  On content-rewards app page: {on_list} ({page.url})")
+    print("  Waiting for the app iframe + feed to render...")
+    fl = wait_for_feed(page, pacer)              # FrameLocator for queries
+    frame = get_app_frame(page)                  # Frame object for .content()/.url
+    scope = fl or page
+    print(f"  App frame: {'found — ' + (frame.url or '') if frame else 'NOT FOUND'}")
+
+    # Dump the FRAME's document — that's where the cards live. page.content() misses
+    # them entirely (cross-origin iframe).
+    if frame is not None:
+        try:
+            Path("probe_list.html").write_text(frame.content(), encoding="utf-8")
+            print("  Saved probe_list.html (app-frame document)")
+        except Exception as e:
+            print(f"  (frame content unavailable, dumping top page: {e})")
+            Path("probe_list.html").write_text(page.content(), encoding="utf-8")
+    else:
+        Path("probe_list.html").write_text(page.content(), encoding="utf-8")
+        print("  Saved probe_list.html (top page — frame not found)")
+
+    sel, n = pick_card_selector(scope)
+    print(f"  Best card selector: {sel!r} matched {n} element(s).")
+    if not sel or not n:
+        print("  No cards matched yet, but probe_list.html holds the app-frame DOM.")
+        print("  Send it to Claude to fix selectors.CARD, then re-probe.")
+        return
+
+    card = scope.locator(sel).first
+    try:
+        card.screenshot(path="probe_card.png")
+        print("  Saved probe_card.png")
+    except Exception as e:
+        print(f"  (could not screenshot card: {e})")
+    print("  Sample card extraction:")
+    for k, v in extract.extract_card(card).items():
+        print(f"    {k}: {v}")
+
+    _probe_detail(page, pacer, card, frame)
+
+
+def _probe_detail(page, pacer, card, list_frame):
+    """Click a card and figure out whether detail opens in the FRAME or the TOP page
+    (handle both), then dump whichever document holds the detail and sample-extract."""
+    pre_page = page.url
+    pre_frame = list_frame.url if list_frame else None
+    clicked = False
+    try:
+        pacer.maybe_hover(card)
+        pacer.page_delay()
+        try:
+            card.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+        card.click(timeout=8000)
+        clicked = True
+    except Exception as e:
+        print(f"  (normal click failed: {(str(e).splitlines() or ['?'])[0]}; retrying with force)")
+        try:
+            card.click(timeout=5000, force=True)
+            clicked = True
+        except Exception as e2:
+            print(f"  (force click failed too: {(str(e2).splitlines() or ['?'])[0]})")
+    time.sleep(2.5)
+
+    post_frame_obj = get_app_frame(page)
+    post_page = page.url
+    post_frame = post_frame_obj.url if post_frame_obj else None
+    navigated = (post_page != pre_page) or (post_frame != pre_frame)
+    print(f"  Clicked: {clicked}")
+    print(f"  After click — page: {pre_page} -> {post_page}")
+    print(f"               frame: {pre_frame} -> {post_frame}")
+
+    # Dump the best available detail document REGARDLESS, so probe_detail.html always
+    # exists for selector work. Warn loudly if nothing actually navigated.
+    if post_frame_obj is not None:
+        detail_doc, detail_scope = post_frame_obj, (get_app_frame_locator(page) or page)
+    else:
+        detail_doc, detail_scope = page, page
+    try:
+        Path("probe_detail.html").write_text(detail_doc.content(), encoding="utf-8")
+        page.screenshot(path="probe_detail.png", full_page=True)
+        tag = "looks like a detail page" if navigated else "WARNING: nothing navigated — may still be the list"
+        print(f"  Saved probe_detail.html / probe_detail.png ({tag})")
+        print("  Sample detail extraction:")
+        for k, v in extract.extract_detail(detail_scope).items():
+            print(f"    {k}: {v}")
+    except Exception as e:
+        print(f"  (detail dump skipped: {(str(e).splitlines() or ['?'])[0]})")
+
+
+# --- phase 1: list pass --------------------------------------------------------
+def collect_cards(page, pacer, cfg, deadline_ts):
+    print("Phase 1 — scanning the Content Rewards list (human scroll)...")
+    if extract.is_challenge(page):
+        raise StopRun("challenge on the list page")
+    # Cards render inside the app iframe; wait_for_feed returns that FrameLocator.
+    fl = wait_for_feed(page, pacer)
+    scope = fl or page
+    sel, n = pick_card_selector(scope)
+    if not sel:
+        print("  No cards found with current selectors. Run `python scout.py --probe`.")
+        return []
+
+    cards_by_id = {}
+    stable = 0
+    while stable < cfg.list_stable_rounds:
+        locs = scope.locator(sel)
+        new_found = 0
+        for i in range(locs.count()):
+            try:
+                data = extract.extract_card(locs.nth(i))
+            except Exception:
+                continue
+            cid = data.get("id")
+            if cid and cid not in cards_by_id:
+                cards_by_id[cid] = data
+                new_found += 1
+        print(f"  {len(cards_by_id)} unique cards seen...", end="\r")
+
+        stable = stable + 1 if new_found == 0 else 0
+        if time.monotonic() > deadline_ts:
+            print("\n  Time budget reached during the list scan.")
+            break
+        scroll_list(page, pacer)
+
+    print(f"\n  Phase 1 done: {len(cards_by_id)} unique cards.")
+    return list(cards_by_id.values())
+
+
+# --- pre-filter ----------------------------------------------------------------
+def prefilter(cards, cfg, known_ids=None):
+    known_ids = set(known_ids or ())
+    survivors, skipped = [], []
+    required = set(cfg.prefilter_required_platforms)
+    for c in cards:
+        # Known campaigns (already scraped, cached in campaigns.json) bypass the pre-filter
+        # entirely. The pre-filter exists ONLY to spare browser/session budget on UNREACHED
+        # campaigns, and a known campaign costs none (free card-level refresh). Demoting a
+        # previously-ranked campaign out of the rankings via a budget-saving gate is a
+        # regression — only the DONE list removes a scraped campaign from ranking. It stays a
+        # survivor here and is routed to the free-refresh path in run_detail_pass.
+        if c.get("id") in known_ids:
+            survivors.append(c)
+            continue
+
+        reasons = []
+
+        pay = c.get("pay_per_1k")
+        if cfg.prefilter_min_pay_per_1k and pay is not None and pay < cfg.prefilter_min_pay_per_1k:
+            reasons.append(f"pay ${pay:.2f}/1k < ${cfg.prefilter_min_pay_per_1k:.2f}")
+
+        rem = c.get("budget_remaining_fraction")
+        if rem is not None and rem <= cfg.prefilter_min_budget_remaining:
+            reasons.append(f"budget {rem*100:.0f}% <= {cfg.prefilter_min_budget_remaining*100:.0f}%")
+
+        plats = set(c.get("platforms") or [])
+        if required and plats and not (plats & required):
+            reasons.append("no tiktok/shorts/reels")
+
+        if reasons:
+            skipped.append((c, "; ".join(reasons)))
+        else:
+            survivors.append(c)
+    return survivors, skipped
+
+
+# --- records -------------------------------------------------------------------
+# Fields filled by enrich_active()/passes later; None means "honestly unknown".
+_ANALYSIS_DEFAULTS = {
+    "min_payout": None, "min_views_to_payout": None, "high_minimum": False,
+    "max_payout_per_video": None, "max_payout_uncapped": False,
+    "participants_per_1k_budget": None,
+    "category": None,
+    "join_cta": None, "open_to_all": "unclear",
+    "disqualifiers": [], "disqualified": False,
+    "first_seen_at": None, "days_active": None, "payout_velocity": None,
+    "snapshot": None, "snapshot_history": None, "trends": None,
+    # cross-run + strategic signals (filled by strategic.compute_strategic_signals)
+    "budget_drain": None, "participant_growth": None, "source_saturation": None,
+    "recurring_creator": None, "account_reusability": None,
+    "source": None,
+    "repeatable_clippability": None,
+    "footage_stats": None,
+    # footage SUBSTANCE intake (intake.py) — accessibility / type / volume / density
+    "footage_intake": None, "footage_access": None, "content_type": None,
+    "footage_volume": None, "action_density": None,
+    # campaign locator for the clipper handoff (Task A). campaign_id (the app-frame UUID),
+    # url (built from it), frame_url (raw apps.whop.com route), and brief_url (the dialog's
+    # 'Brief' Google-Doc link that feeds intake) are captured when the Radix detail modal
+    # opens; locator_missing flags a campaign we couldn't locate so the clipper can fail loud
+    # on it instead of silently proceeding. Never crashes on a miss.
+    "campaign_id": None, "locator_missing": False, "brief_url": None, "frame_url": None,
+}
+
+
+def card_only_record(card, status, skip_reason=None):
+    rec = {
+        "id": card.get("id"),
+        "url": card.get("url"),
+        "status": status,
+        "skip_reason": skip_reason,
+        "scraped_at": None,
+        "name": card.get("name"),
+        "creator": None,
+        "pay_value": card.get("pay_value"),
+        "pay_unit": card.get("pay_unit"),
+        "pay_per_1k": card.get("pay_per_1k"),
+        "budget_paid": card.get("budget_paid"),
+        "budget_total": card.get("budget_total"),
+        "budget_remaining_fraction": card.get("budget_remaining_fraction"),
+        "platforms": card.get("platforms") or [],
+        "source_links": [],
+        "rules_text": None,
+        "participants": None,
+        "deadline": None,
+    }
+    rec.update({k: (list(v) if isinstance(v, list) else v)
+                for k, v in _ANALYSIS_DEFAULTS.items()})
+    rec["source"] = {"name": None, "handles": [], "reach_estimate": None,
+                     "recent_avg_views": None, "confidence": "UNKNOWN"}
+    # Card-only stubs are never opened, so no locator was captured — mark it missing so a
+    # downstream picker knows this record can't be located without a real scrape.
+    rec["campaign_id"] = None
+    rec["locator_missing"] = True
+    return rec
+
+
+def build_record(card, detail, status):
+    def pick(a, b):
+        return a if a is not None else b
+    rec = {
+        "id": card.get("id"),
+        "url": detail.get("url") or card.get("url"),
+        "status": status,
+        "skip_reason": None,
+        "scraped_at": _now_iso(),
+        "name": detail.get("name") or card.get("name"),
+        "creator": detail.get("creator"),
+        "pay_value": pick(detail.get("pay_value"), card.get("pay_value")),
+        "pay_unit": detail.get("pay_unit") or card.get("pay_unit"),
+        "pay_per_1k": pick(detail.get("pay_per_1k"), card.get("pay_per_1k")),
+        "budget_paid": pick(detail.get("budget_paid"), card.get("budget_paid")),
+        "budget_total": pick(detail.get("budget_total"), card.get("budget_total")),
+        "budget_remaining_fraction": pick(
+            detail.get("budget_remaining_fraction"), card.get("budget_remaining_fraction")
+        ),
+        "platforms": detail.get("platforms") or card.get("platforms") or [],
+        "source_links": detail.get("source_links") or [],
+        "rules_text": detail.get("rules_text"),
+        "participants": detail.get("participants"),
+        "deadline": detail.get("deadline"),
+    }
+    rec.update({k: (list(v) if isinstance(v, list) else v)
+                for k, v in _ANALYSIS_DEFAULTS.items()})
+    rec["join_cta"] = detail.get("join_cta")   # scraped from the page; keep over the default
+    # LOCATOR (Task A): captured while the detail modal was open (see _capture_locator /
+    # scrape_detail). campaign_id is the per-campaign UUID from the app-frame route; url is the
+    # human-clickable whop.com URL built from it (frame_url keeps the raw apps.whop.com route);
+    # brief_url is the dialog's 'Brief' link for intake. campaign_id falls back to the URL's
+    # last segment for old/fallback urls. locator_missing is True only when we captured NEITHER
+    # a URL nor an id — a genuinely unlocatable campaign the clipper must fail loud on.
+    rec["url"] = detail.get("url") or card.get("url")
+    rec["campaign_id"] = detail.get("campaign_id") or extract.campaign_id_from_url(rec["url"])
+    rec["brief_url"] = detail.get("brief_url")
+    rec["frame_url"] = detail.get("frame_url")
+    rec["locator_missing"] = not (rec["url"] or rec["campaign_id"])
+    return rec
+
+
+def _make_snapshot(rec, ts):
+    """A per-run snapshot of the volatile metrics, for cross-run trend diffing."""
+    return {
+        "ts": ts,
+        "budget_paid": rec.get("budget_paid"),
+        "budget_remaining_fraction": rec.get("budget_remaining_fraction"),
+        "participants": rec.get("participants"),
+    }
+
+
+def enrich_active(rec, cfg, prev_rec=None, now=None):
+    """Derive every analysis dimension for one active record: minimum-payout viability,
+    source scaffold, max payout, competition, category, hard disqualifiers, campaign
+    age + payout velocity, and the cross-run snapshot/trend. Idempotent; reads only
+    already-scraped fields (the follower + clipper lookups happen in later passes).
+    `prev_rec` is the same campaign from the previous run (for trends + first_seen)."""
+    now = now or datetime.now(timezone.utc)
+    rules = rec.get("rules_text")
+    pay = rec.get("pay_per_1k")
+
+    # minimum-payout viability
+    min_payout = extract.parse_min_payout(rules)
+    mv = extract.min_views_to_payout(min_payout, pay)
+    rec["min_payout"] = min_payout
+    rec["min_views_to_payout"] = mv
+    rec["high_minimum"] = mv is not None and mv > cfg.min_payout_max_views
+
+    # max payout per video
+    mp = extract.parse_max_payout(rules)
+    rec["max_payout_per_video"] = mp["max_payout_per_video"]
+    rec["max_payout_uncapped"] = mp["uncapped"]
+
+    # competition per dollar
+    rec["participants_per_1k_budget"] = extract.participants_per_1k_budget(
+        rec.get("participants"), rec.get("budget_total"))
+
+    # category + open-to-instant-join classification + hard disqualifiers. Openness reads
+    # the brief plus the page CTA (Apply vs Join); an application/selection gate is a hard DQ.
+    rec["category"] = extract.classify_category(rec.get("name"), rules, rec.get("platforms"))
+    rec["open_to_all"] = extract.classify_openness(rules, rec.get("join_cta"))
+    rec["disqualifiers"] = extract.detect_disqualifiers(
+        rules, rec.get("platforms"), rec.get("source_links"), rec.get("join_cta"))
+    rec["disqualified"] = bool(rec["disqualifiers"])
+
+    # campaign age (first_seen carried across runs) + payout velocity
+    first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \
+        or now.isoformat()
+    rec["first_seen_at"] = first_seen
+    try:
+        days = (now - datetime.fromisoformat(first_seen)).total_seconds() / 86400.0
+        rec["days_active"] = round(max(days, 0.0), 3)
+    except Exception:
+        rec["days_active"] = None
+    rec["payout_velocity"] = extract.payout_velocity(
+        rec.get("budget_paid"), rec.get("budget_total"), rec.get("days_active"))
+
+    # cross-run snapshot + accumulating history (built on, not replacing, prior runs) +
+    # trend. The history is what the budget-drain / participant-growth projections use.
+    carried_hist = list((prev_rec or {}).get("snapshot_history") or [])
+    prev_snap = (prev_rec or {}).get("snapshot")
+    if prev_snap:
+        carried_hist.append(prev_snap)
+    cap = getattr(cfg, "max_snapshot_history", 20)
+    rec["snapshot_history"] = carried_hist[-cap:]
+    rec["snapshot"] = _make_snapshot(rec, now.isoformat())
+    rec["trends"] = scoring.compute_trends(rec["snapshot"], prev_snap)
+
+    # source scaffold (preserve counts already retrieved on a prior run)
+    existing = rec.get("source")
+    if not existing or not existing.get("handles"):
+        handles = extract.extract_handles(rules, rec.get("source_links"))
+        name = rec.get("creator")
+        rec["source"] = {
+            "name": name,
+            "handles": handles,
+            "reach_estimate": (existing or {}).get("reach_estimate"),
+            "recent_avg_views": (existing or {}).get("recent_avg_views"),
+            "confidence": (existing or {}).get("confidence")
+            or ("LOW" if (name or handles) else "UNKNOWN"),
+        }
+
+
+# --- phase 2: detail pass ------------------------------------------------------
+# Clicking a card does NOT navigate — it opens an in-frame Radix dialog overlaid on
+# the list (which stays mounted behind it). So we open by clicking the card, extract
+# from the dialog, then press Escape to close and return to the exact same list. We
+# find the card by its accessible name ("View <NAME> campaign"), so we never depend
+# on scroll position surviving — the lookup re-resolves the card wherever it is.
+def _click_with_retry(locator, cfg, pacer, *, hover=None):
+    """Click with a generous timeout and RETRIES. Whop's iframe UI is often slower than one
+    click timeout, so a lone timeout is usually transient slowness, not a real failure — we
+    wait briefly and retry `cfg.click_retries` times. Only the last exception (all attempts
+    exhausted) propagates, so a caller's failure counter ticks once per genuinely stuck
+    element, not once per slow attempt. StopRun is never swallowed."""
+    attempts = max(1, cfg.click_retries)
+    last = None
+    for i in range(attempts):
+        try:
+            if hover is not None:
+                try:
+                    pacer.maybe_hover(hover)
+                except Exception:
+                    pass
+            locator.click(timeout=cfg.click_timeout_ms)
+            return
+        except StopRun:
+            raise
+        except Exception as e:                       # transient (timeout / stale) — retry
+            last = e
+            if i < attempts - 1:
+                time.sleep(random.uniform(*cfg.click_retry_wait))
+    raise last
+
+
+def open_detail(page, fl, name, pacer, cfg):
+    """Click the card for `name` and return its open dialog Locator. Retries slow clicks;
+    raises a plain Exception on transient failure (caught + retried per-campaign) but StopRun
+    ONLY on a real block (challenge / login wall) so the run-ending tripwire stays specific."""
+    btn = fl.get_by_role("button", name=f"View {name} campaign", exact=True).first
+    try:
+        btn.scroll_into_view_if_needed(timeout=cfg.scroll_into_view_ms)
+    except Exception:
+        pass
+    _click_with_retry(btn, cfg, pacer, hover=btn)
+    if extract.is_challenge(page) or extract.is_login_wall(page):
+        raise StopRun("challenge / login wall after opening a campaign")
+    dialog = fl.locator(S.DETAIL_DIALOG[0]).first
+    dialog.wait_for(state="visible", timeout=cfg.dialog_wait_ms)
+    pacer.page_delay()
+    return dialog
+
+
+def close_detail(page, fl):
+    """Escape closes the Radix dialog; the list is preserved behind it."""
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        fl.locator(S.DETAIL_DIALOG[0]).first.wait_for(state="detached", timeout=5000)
+    except Exception:
+        try:  # one more nudge if it didn't dismiss
+            page.keyboard.press("Escape")
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+
+def _scroll_dialog(page, pacer):
+    """Gentle human scroll inside the centered detail dialog."""
+    try:
+        vp = page.viewport_size or {"width": 1366, "height": 768}
+        page.mouse.move(vp["width"] / 2, vp["height"] / 2)
+        for _ in range(random.randint(1, 3)):
+            page.mouse.wheel(0, random.randint(*pacer.scroll_step))
+            time.sleep(random.uniform(*pacer.scroll_pause))
+    except Exception:
+        pass
+
+
+def _frame_url(page):
+    fr = get_app_frame(page)
+    return fr.url if fr else None
+
+
+def _looks_campaign_url(url, list_page_url):
+    """A campaign-specific whop.com URL, not the list/discover/root base."""
+    if not url:
+        return False
+    u = url.rstrip("/")
+    bases = {(list_page_url or "").rstrip("/"), S.DISCOVER_URL.rstrip("/"), "https://whop.com"}
+    return "whop.com" in u and u not in bases
+
+
+def _return_to_list(page, fl, list_page_url, pacer):
+    """After a full-page expand, go back to the list and confirm the feed is back.
+    Cards aren't virtualized, so once the feed re-renders every card is findable."""
+    try:
+        page.go_back(timeout=10000)
+    except Exception:
+        pass
+    time.sleep(1.0)
+    if wait_for_feed(page, pacer) is not None:
+        return True
+    navigate_to_list(page, pacer)  # last resort: re-enter through discover
+    return wait_for_feed(page, pacer) is not None
+
+
+def _recover_list(page, fl, list_page_url, pacer):
+    """After a failed/slow scrape, dismiss any half-open dialog and confirm the list feed is
+    healthy again BEFORE continuing — so one stuck card doesn't cascade into more failures
+    (a partially-opened dialog left over the list breaks the next card's click). Best-effort,
+    never raises; returns True if the feed looks healthy."""
+    try:
+        close_detail(page, fl)          # Escape any stray/half-open dialog
+    except Exception:
+        pass
+    try:
+        if wait_for_feed(page, pacer) is not None:
+            return True
+    except Exception:
+        pass
+    try:                                 # last resort: re-enter the list through discover
+        navigate_to_list(page, pacer)
+        return wait_for_feed(page, pacer) is not None
+    except Exception:
+        return False
+
+
+def _abs_whop_url(href):
+    """Absolutize a possibly-relative whop href. None if not usable."""
+    if not href:
+        return None
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return "https://whop.com" + href
+    return None
+
+
+def _href_from_dialog(dialog, list_page_url):
+    """Read a clickable campaign URL straight from an anchor in the open dialog — NO
+    navigation. Whop's 'Expand to full page' / share / title controls are frequently
+    `<a href>`, and reading the href is far more reliable than clicking through and diffing
+    `page.url` (and needs no fragile return-to-list). Returns a campaign URL or None."""
+    selectors = (
+        'a[href*="whop.com"][href*="/app"]',   # most specific: a campaign app link
+        'a[href^="/"][href*="/app"]',          # relative campaign app link
+        'a[href*="whop.com"]',                  # any whop.com anchor
+        'a[href^="/"]',                         # any relative anchor (absolutized below)
+    )
+    for sel in selectors:
+        try:
+            locs = dialog.locator(sel)
+            count = locs.count()
+        except Exception:
+            continue
+        for i in range(min(count, 15)):
+            try:
+                url = _abs_whop_url(locs.nth(i).get_attribute("href"))
+            except Exception:
+                continue
+            if _looks_campaign_url(url, list_page_url):
+                return url
+    return None
+
+
+# A campaign locator UUID (e.g. dd9f7918-e51d-4935-9f23-5935c783774a).
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _campaign_uuid_from_frame(frame_url):
+    """The per-campaign UUID from the app-frame's route, or None. CONFIRMED by --test-capture:
+    when the detail modal opens, the app frame (apps.whop.com) client-routes from
+    `.../discover` to `.../discover/<UUID>`, where <UUID> is the campaign locator. (The
+    `app_...` id in the path is the SHARED Content-Rewards app id — same for every campaign —
+    NOT the locator; don't confuse them.) The literal `discover` base has no UUID -> None."""
+    if not frame_url:
+        return None
+    seg = frame_url.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+    return seg if _UUID_RE.fullmatch(seg or "") else None
+
+
+def _brief_url_from_dialog(dialog):
+    """The campaign's brief link straight off the open dialog — the <a> whose text contains
+    'Brief' (the live dump showed 'Google DriveBrief' -> a Google Doc URL). This is the brief
+    SOURCE the clipper's intake consumes, captured navigation-free. External (Google) URLs are
+    returned as-is; a relative whop href is absolutized. None if absent. Never raises."""
+    try:
+        locs = dialog.locator("a")
+        count = locs.count()
+    except Exception:
+        return None
+    for i in range(min(count, 40)):
+        try:
+            a = locs.nth(i)
+            text = (a.text_content() or "").strip().lower()
+            href = a.get_attribute("href")
+        except Exception:
+            continue
+        if href and "brief" in text:
+            return href if href.startswith("http") else (_abs_whop_url(href) or href)
+    return None
+
+
+def _capture_locator(page, fl, list_page_url):
+    """Read the campaign locator from the OPEN detail modal — the PRIMARY, navigation-free
+    path (confirmed via --test-capture live diagnostics). Sources:
+      - campaign_id: the UUID in the app-frame route (`_campaign_uuid_from_frame`).
+      - url: the human-clickable whop.com campaign URL built from the shared app id + that
+        UUID (`https://whop.com/discover/app/<app_id>/<UUID>`). `frame_url` keeps the raw
+        apps.whop.com route as the confirmed-canonical fallback for verification.
+      - brief_url: the dialog's 'Brief' anchor (Google Doc/Drive), for intake.
+    Every field degrades to None; never raises. locator_missing (set in build_record) is True
+    only when we got NEITHER a url nor a campaign_id."""
+    frame_url = _frame_url(page)
+    campaign_id = _campaign_uuid_from_frame(frame_url)
+    url = f"https://whop.com/discover/app/{_app_id()}/{campaign_id}" if campaign_id else None
+    brief_url = None
+    try:
+        brief_url = _brief_url_from_dialog(fl.locator(S.DETAIL_DIALOG[0]).first)
+    except Exception:
+        pass
+    return {"campaign_id": campaign_id, "url": url,
+            "frame_url": frame_url, "brief_url": brief_url}
+
+
+# Set True by the --test-capture diagnostic to make capture_campaign_url narrate each tier.
+_CAPTURE_DEBUG = False
+
+# Runs inside the app frame. Introspects the OPEN dialog for every place a campaign locator
+# could live: anchors, buttons (to find the real expand/share control), id-like/data-*
+# attributes, the frame's own client-side route (location.href — changes here do NOT touch
+# the top address bar), and any Whop-style prefixed id token (app_/campaign_/prod_/…) sitting
+# in the dialog HTML. Returns the raw dialog outerHTML too, for offline inspection.
+_LOCATOR_DUMP_JS = r"""
+() => {
+  const d = document.querySelector('[role="dialog"]')
+        || document.querySelector('.campaign-details-modal-bg');
+  const out = {frameUrl: location.href, found: !!d};
+  if (!d) return out;
+  out.anchors = [...d.querySelectorAll('a')].slice(0, 40).map(a => ({
+    href: a.getAttribute('href'), text: (a.textContent || '').trim().slice(0, 50)}));
+  out.buttons = [...d.querySelectorAll('button,[role="button"]')].slice(0, 50).map(b => ({
+    aria: b.getAttribute('aria-label'), text: (b.textContent || '').trim().slice(0, 50)}));
+  const attrHits = [];
+  for (const el of d.querySelectorAll('*')) {
+    for (const at of el.attributes) {
+      const n = at.name.toLowerCase();
+      if ((n === 'id' || n.includes('campaign') || n.includes('slug') || n.includes('testid')
+           || n.startsWith('data-')) && at.value) {
+        attrHits.push(el.tagName.toLowerCase() + ' [' + at.name + '="'
+                      + String(at.value).slice(0, 70) + '"]');
+      }
+    }
+  }
+  out.attrHits = [...new Set(attrHits)].slice(0, 80);
+  const html = d.outerHTML || '';
+  out.htmlLen = html.length;
+  const idRe = /(?:app|camp|campaign|prod|biz|exp|comp|user|plan)_[A-Za-z0-9]{6,}/g;
+  out.tokens = [...new Set(html.match(idRe) || [])].slice(0, 40);
+  out.html = html;
+  return out;
+}
+"""
+
+
+def _dump_capture_diagnostics(page, idx, name, top_before, top_after,
+                              fr_before, fr_after, reqs):
+    """Heavy per-campaign locator diagnostics for --test-capture. Dumps every candidate
+    source of a campaign locator so we can see where it ACTUALLY lives before writing any
+    selector. Never raises."""
+    print(f"    --- locator diagnostics [{idx}] {name!r} ---")
+    print(f"      top-page url  before/after: {top_before}")
+    print(f"                                  {top_after}   (changed={top_before != top_after})")
+    print(f"      app-frame url before/after: {fr_before}")
+    print(f"                                  {fr_after}   (changed={fr_before != fr_after})")
+    try:
+        for fi, fr in enumerate(page.frames):
+            print(f"      frame[{fi}] name={fr.name!r} url={fr.url}")
+    except Exception as e:
+        print(f"      (frame enumerate failed: {type(e).__name__}: {e})")
+
+    if reqs:
+        print(f"      {len(reqs)} interesting network request(s) fired during modal open:")
+        for m, u in reqs[:25]:
+            print(f"        {m} {u}")
+    else:
+        print("      no campaign/app/api/graphql requests captured during modal open")
+
+    fr = get_app_frame(page)
+    if fr is None:
+        print("      !! app-frame object not found — cannot introspect the dialog DOM")
+        return
+    try:
+        data = fr.evaluate(_LOCATOR_DUMP_JS)
+    except Exception as e:
+        print(f"      (dialog DOM evaluate failed: {type(e).__name__}: {e})")
+        return
+    if not data or not data.get("found"):
+        print(f"      !! no [role=dialog] found in the app frame "
+              f"(frameUrl={None if not data else data.get('frameUrl')})")
+        return
+
+    print(f"      dialog frame location.href: {data.get('frameUrl')}")
+    print(f"      id-like tokens in dialog HTML: {data.get('tokens') or '(none found)'}")
+    anchors = data.get("anchors") or []
+    print(f"      anchors in dialog ({len(anchors)}):")
+    for a in anchors:
+        print(f"        href={a.get('href')!r}  text={a.get('text')!r}")
+    btns = data.get("buttons") or []
+    print(f"      buttons in dialog ({len(btns)}):")
+    for b in btns:
+        print(f"        aria={b.get('aria')!r}  text={b.get('text')!r}")
+    hits = data.get("attrHits") or []
+    print(f"      id/data-* attributes in dialog ({len(hits)}):")
+    for h in hits:
+        print(f"        {h}")
+    try:
+        out = Path(f"probe_capture_{idx}.html")
+        out.write_text(data.get("html") or "", encoding="utf-8")
+        print(f"      full dialog HTML ({data.get('htmlLen')} chars) -> {out}")
+    except Exception as e:
+        print(f"      (dialog HTML dump failed: {type(e).__name__}: {e})")
+
+
+def capture_campaign_url(page, fl, list_page_url, pacer, cfg):
+    """Record a human-clickable campaign URL for the currently-open dialog.
+
+    (1) Cheap: opening the dialog may have shallow-routed the top-page URL already.
+    (2) Robust + navigation-free: read the campaign link's href straight from the dialog.
+    (3) Fallback: click 'Expand to full page', diff the top-page / frame URL, return to the
+    list. Fully non-fatal — returns (url_or_None, list_ok).
+    """
+    dbg = _CAPTURE_DEBUG
+    if _looks_campaign_url(page.url, list_page_url):
+        if dbg:
+            print(f"      [capture] tier1 HIT — top page.url is campaign-specific: {page.url}")
+        return page.url, True
+    if dbg:
+        print(f"      [capture] tier1 miss — page.url={page.url!r} == list base, no top-nav")
+
+    dialog = fl.locator(S.DETAIL_DIALOG[0]).first
+
+    href = _href_from_dialog(dialog, list_page_url)
+    if href:
+        if dbg:
+            print(f"      [capture] tier2 HIT — campaign anchor href in dialog: {href}")
+        return href, True   # got it with zero navigation — the reliable path
+    if dbg:
+        print("      [capture] tier2 miss — no campaign-looking <a href> in the dialog")
+
+    expand = dialog.get_by_role("button", name="Expand to full page").first
+    try:
+        if expand.count() == 0:
+            if dbg:
+                print("      [capture] tier3 skip — no 'Expand to full page' button present")
+            return None, True
+    except Exception:
+        return None, True
+
+    pre_page, pre_frame = page.url, _frame_url(page)
+    try:
+        pacer.maybe_hover(expand)
+        pacer.page_delay()
+        expand.click(timeout=cfg.click_timeout_ms)
+        time.sleep(1.5)
+    except Exception as e:
+        print(f"    (expand failed: {(str(e).splitlines() or ['?'])[0]})")
+        return None, True
+
+    post_page, post_frame = page.url, _frame_url(page)
+    url = None
+    if post_page != pre_page and _looks_campaign_url(post_page, list_page_url):
+        url = post_page                       # preferred: clickable whop.com URL
+    elif post_frame and post_frame != pre_frame:
+        url = post_frame                      # fallback: frame-level (apps.whop.com)
+    if dbg:
+        print(f"      [capture] tier3 diff — page {pre_page!r} -> {post_page!r}; "
+              f"frame {pre_frame!r} -> {post_frame!r}; picked url={url!r}")
+
+    list_ok = _return_to_list(page, fl, list_page_url, pacer)
+    return url, list_ok
+
+
+def scrape_detail(page, fl, name, list_page_url, pacer, cfg):
+    """Open the dialog for `name`, extract it, capture its locator, always close it."""
+    dialog = open_detail(page, fl, name, pacer, cfg)
+    detail, loc = {}, {}
+    try:
+        _scroll_dialog(page, pacer)
+        detail = extract.extract_detail(dialog)
+        # PRIMARY: the app-frame route carries the campaign UUID once the modal is open
+        # (confirmed via --test-capture). Navigation-free and reliable — also grabs brief_url.
+        loc = _capture_locator(page, fl, list_page_url)
+        # Fallback for a human-clickable url ONLY when the frame yielded no UUID (rare): the
+        # old anchor/expand tiers. We skip them otherwise so the fragile expand-and-return
+        # navigation never runs on the happy path.
+        if not loc.get("url"):
+            url, _list_ok = capture_campaign_url(page, fl, list_page_url, pacer, cfg)
+            loc["url"] = url
+    finally:
+        # If the fallback navigated away and back, the dialog is already gone; if it stayed
+        # open (the normal path), Escape closes it. Either way this is safe.
+        close_detail(page, fl)
+    detail["url"] = loc.get("url")
+    detail["campaign_id"] = loc.get("campaign_id")
+    detail["brief_url"] = loc.get("brief_url")
+    detail["frame_url"] = loc.get("frame_url")
+    return detail
+
+
+def _has_cached_detail(rec):
+    """True when we hold a REAL scraped detail record for a campaign, not just a card-only
+    stub. A scraped record stamps `scraped_at` (and carries rules/source detail); card-only
+    stubs (`skipped_prefilter` / `not_listed_this_run` never-scraped) leave it None. This is
+    the single definition of "known" used for BOTH pre-filter exemption and the
+    refresh-vs-scrape partition, so a stub is treated as UNREACHED — re-evaluated by the
+    pre-filter and actually scraped if it now passes — never routed to the free-refresh path
+    where it would rank on empty detail and never get scraped."""
+    return bool(rec and rec.get("scraped_at"))
+
+
+def run_detail_pass(page, fl, survivors, prev_by_id, state, pacer, cfg, deadline_ts,
+                    refresh, completed_ids=None):
+    print(f"Phase 2 — detail pass on {len(survivors)} survivors "
+          f"({'full refresh' if refresh else 'delta: unreached campaigns first'})...")
+    if fl is None:
+        print("  App frame not available — cannot open detail dialogs.")
+        return [], []
+    completed_ids = set(completed_ids or [])
+
+    # Partition survivors. DONE campaigns (the clipper has exhausted them) are dropped —
+    # neither scraped nor ranked. Of the rest, a campaign we already hold REAL cached detail
+    # for (`_has_cached_detail`, not merely a card-only stub in prev_by_id) is KNOWN: it needs
+    # NO browser visit and must not consume any session budget — just a free card-level
+    # refresh, and it STAYS a ranked candidate. Everything else — never scraped, INCLUDING
+    # card-only stubs from a prior pre-filter skip — is UNREACHED and gets the ENTIRE session
+    # budget (so a stub that now passes the looser pre-filter finally gets scraped for detail
+    # instead of ranking on empties). `--refresh` re-scrapes everything.
+    to_refresh, to_scrape, n_done = [], [], 0
+    for c in survivors:
+        cid = c.get("id")
+        if cid in completed_ids:
+            n_done += 1
+        elif (not refresh) and _has_cached_detail(prev_by_id.get(cid)):
+            to_refresh.append(c)
+        else:
+            to_scrape.append(c)
+    if n_done:
+        print(f"  {n_done} clipper-completed campaign(s) skipped (on the DONE list).")
+
+    results, new_ids = [], []
+
+    # 1) KNOWN campaigns — cheap, NO browser, NO pacing, NO session budget. They remain
+    #    ranked candidates (a scraped campaign is NOT done until the clipper says so); we
+    #    only refresh volatile card-level numbers (budget paid/remaining, pay) from the list
+    #    card and reuse all cached detail + analysis from campaigns.json. Cross-run budget
+    #    trends still work off these card-level deltas.
+    for c in to_refresh:
+        rec = dict(prev_by_id[c["id"]])
+        for k in ("budget_paid", "budget_total", "budget_remaining_fraction"):
+            if c.get(k) is not None:
+                rec[k] = c[k]
+        if c.get("pay_per_1k") is not None:
+            rec["pay_per_1k"] = c["pay_per_1k"]
+            rec["pay_unit"] = c["pay_unit"]
+            rec["pay_value"] = c["pay_value"]
+        rec["status"] = "refreshed"
+        rec["refreshed_at"] = _now_iso()
+        results.append(rec)
+    print(f"  {len(to_refresh)} known campaign(s) refreshed from the list (no re-scrape, "
+          f"still ranked); {len(to_scrape)} unreached to scrape with the full budget.")
+
+    # 2) UNREACHED campaigns — the ENTIRE session budget (max_campaigns / time) goes here,
+    #    in list order, so successive runs keep filling the board where the last one stopped.
+    consecutive_failures = 0
+    processed = 0
+    prev_name = None
+    total = len(to_scrape)
+    list_page_url = page.url  # baseline for detecting campaign URLs on expand
+    for c in to_scrape:
+        if processed >= cfg.max_campaigns:
+            print("\n  Session cap: max campaigns reached — stopping cleanly.")
+            break
+        if time.monotonic() > deadline_ts:
+            print("\n  Session cap: time budget reached — stopping cleanly.")
+            break
+
+        cid = c["id"]
+        try:
+            detail = scrape_detail(page, fl, c["name"], list_page_url, pacer, cfg)
+            rec = build_record(c, detail, status="scraped")
+            results.append(rec)
+            if not state.is_known(cid):
+                new_ids.append(cid)
+            state.mark_scraped(cid, rec.get("url"))
+            consecutive_failures = 0
+        except StopRun:
+            raise                       # HARD block (captcha / login wall) — end the run now
+        except Exception as e:
+            # RECOVERABLE (click timeout / slowness / transient): the click already retried
+            # cfg.click_retries times, so this is a genuine per-card failure — but routine,
+            # not a block. A real block would have raised StopRun above.
+            consecutive_failures += 1
+            log_error(cfg.errors_path, c.get("name"), e)
+            # A mid-run block can also surface as an ordinary exception — check explicitly.
+            if extract.is_challenge(page) or extract.is_login_wall(page):
+                raise StopRun("challenge / login wall detected mid-run")
+            # Half-opened dialog left over the list breaks the next click — recover first.
+            _recover_list(page, fl, list_page_url, pacer)
+            if consecutive_failures >= cfg.max_consecutive_failures:
+                raise StopRun(f"{consecutive_failures} consecutive failures — likely a real "
+                              "block or a page-structure change, not routine slowness")
+            processed += 1
+            continue
+
+        processed += 1
+        print(f"  {processed}/{total} unreached scraped · {len(new_ids)} new · "
+              f"next break ~{pacer.campaigns_until_break}      ", end="\r")
+
+        # rare human double-back: briefly re-open the previous campaign's dialog
+        if prev_name and pacer.should_revisit():
+            try:
+                open_detail(page, fl, prev_name, pacer, cfg)
+                pacer.page_delay()
+            except StopRun:
+                raise
+            except Exception:
+                pass
+            else:
+                close_detail(page, fl)
+        prev_name = c["name"]
+
+        pacer.tick()
+        pacer.page_delay()
+
+    print("")
+    return results, new_ids
+
+
+# --- assembly ------------------------------------------------------------------
+def load_prev_campaigns(path):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return {c["id"]: c for c in data.get("campaigns", []) if c.get("id")}
+    except Exception:
+        return {}
+
+
+def load_completed(path):
+    """Set of campaign IDs the CLIPPER has processed/exhausted (the DONE list). The clipper
+    writes `completed_campaigns.json` (or use --mark-done); these are the ONLY campaigns
+    excluded from scraping AND ranking. Accepts either {"completed": [...]} or a bare list;
+    ids may be strings or {"id": ...} objects. Never raises — a bad/missing file = no dones."""
+    p = Path(path)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        items = data.get("completed", []) if isinstance(data, dict) else data
+        return {(x.get("id") if isinstance(x, dict) else x) for x in items if x}
+    except Exception:
+        return set()
+
+
+def save_completed(path, ids):
+    """Persist the DONE list (sorted ids under a "completed" key). Atomic-ish write."""
+    payload = {"completed": sorted(str(i) for i in ids if i)}
+    Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def update_completed(path, ids, *, remove=False):
+    """Add (or with remove=True, drop) campaign ids on the DONE list. Returns the new set."""
+    current = load_completed(path)
+    ids = {str(i) for i in ids if i}
+    current = (current - ids) if remove else (current | ids)
+    save_completed(path, current)
+    return current
+
+
+def assemble(results, skipped_records, prev_by_id, seen_ids, completed_ids=None):
+    completed_ids = set(completed_ids or [])
+    all_records, have = [], set()
+
+    def _add(rec):
+        cid = rec.get("id")
+        if cid in have:
+            return
+        have.add(cid)
+        all_records.append(rec)
+
+    # Live results + prefilter-skipped, EXCLUDING clipper-completed (added once below as
+    # status "completed" so they can't also appear as a ranked/skipped candidate).
+    for rec in list(results) + list(skipped_records):
+        if rec.get("id") in completed_ids:
+            continue
+        _add(rec)
+
+    # Carry forward campaigns we knew about but didn't see listed this run (skip completed).
+    seen = set(seen_ids)
+    for cid, rec in prev_by_id.items():
+        if cid in completed_ids or cid in seen or cid in have:
+            continue
+        carried = dict(rec)
+        carried["status"] = "not_listed_this_run"
+        _add(carried)
+
+    # DONE campaigns (clipper-exhausted): preserved for history + shown in their own section,
+    # but marked "completed" so they're EXCLUDED from ranking (and from scraping upstream).
+    for cid in completed_ids:
+        base = prev_by_id.get(cid)
+        if base is None:
+            continue  # nothing ever scraped for it — nothing to preserve
+        done = dict(base)
+        done["status"] = "completed"
+        done["composite_score"] = 0        # terminal — never ranked (unambiguous, not stale)
+        done["composite_breakdown"] = None
+        done["pre_score"] = 0
+        _add(done)
+
+    # Cross-run + strategic signals need the FULL list (recurring-creator counts across
+    # the whole run history). Runs before scoring so composite can weight them.
+    strategic_mod.compute_strategic_signals(all_records)
+
+    for rec in all_records:
+        if rec.get("status") in ("scraped", "refreshed"):
+            rec["pre_score"] = pre_score(rec)
+            comp, breakdown = composite_score(rec)
+            rec["composite_score"] = comp
+            rec["composite_breakdown"] = breakdown
+        else:
+            rec.setdefault("pre_score", 0)
+            rec.setdefault("composite_score", 0)
+            rec.setdefault("composite_breakdown", None)
+    return all_records
+
+
+# --- throwaway URL-capture diagnostic (--test-capture) -------------------------
+def run_test_capture(session, pacer, cfg, n):
+    """THROWAWAY diagnostic: open the first `n` campaigns' detail modals on the LIVE DOM
+    (open_detail -> heavy locator diagnostics -> capture_campaign_url -> close_detail) to find
+    where the campaign locator actually lives. For each, it dumps every candidate source —
+    top-page url, app-frame location.href (before/after open), all page frames, network
+    requests fired during open, and the dialog's anchors / buttons / id+data-* attributes /
+    embedded id tokens (+ full dialog HTML to probe_capture_<i>.html) — then runs the real
+    capture_campaign_url so its (currently empty) result can be compared against them. Writes
+    campaigns_test.json; NEVER touches the real campaigns.json. No ranking/footage/clips.
+
+    Fails loud (exit 1) if the browser/login isn't usable — no cards, or no app frame."""
+    global _CAPTURE_DEBUG
+    _CAPTURE_DEBUG = True   # make capture_campaign_url narrate each tier
+    page = session.page
+    deadline_ts = time.monotonic() + cfg.max_minutes * 60  # generous; this is a short run
+
+    # Capture network requests fired while a modal opens — the campaign id often rides in a
+    # detail/GraphQL fetch URL even when nothing in the address bar or DOM changes.
+    req_log = []
+
+    def _on_request(req):
+        try:
+            u = req.url
+            if re.search(r"campaign|app_|/api/|graphql|experience", u, re.I):
+                req_log.append((req.method, u))
+        except Exception:
+            pass
+
+    page.on("request", _on_request)
+
+    cards = collect_cards(page, pacer, cfg, deadline_ts)
+    if not cards:
+        print("\n!! --test-capture: NO cards found — browser/login/selectors unavailable. "
+              "Log in in the opened window, or run `python scout.py --probe` to diagnose. "
+              "Aborting; nothing captured.")
+        raise SystemExit(1)
+
+    fl = get_app_frame_locator(page)
+    if fl is None:
+        print("\n!! --test-capture: app frame not available — cannot open detail dialogs. "
+              "Aborting.")
+        raise SystemExit(1)
+
+    targets = cards[:n]
+    print(f"\n== --test-capture (DIAGNOSTIC): {len(targets)} of {len(cards)} campaign(s) "
+          f"through the full detail path, dumping every locator source ==")
+    list_page_url = page.url
+    records = []
+    for i, c in enumerate(targets, 1):
+        name = c.get("name")
+        print(f"\n  [{i}/{len(targets)}] opening: {name} ...")
+        top_before, fr_before = page.url, _frame_url(page)
+        req_log.clear()
+        try:
+            dialog = open_detail(page, fl, name, pacer, cfg)
+        except StopRun:
+            raise  # challenge / login wall — fail loud, don't retry
+        except Exception as e:
+            msg = (str(e).splitlines() or ["?"])[0]
+            print(f"      open failed: {type(e).__name__}: {msg}")
+            records.append(build_record(c, {}, status="scrape_failed"))
+            _recover_list(page, fl, list_page_url, pacer)
+            continue
+
+        # Modal is open — dump every candidate locator source BEFORE anything navigates.
+        top_after, fr_after = page.url, _frame_url(page)
+        _dump_capture_diagnostics(page, i, name, top_before, top_after,
+                                  fr_before, fr_after, list(req_log))
+
+        # Now run the REAL locator capture so we can see exactly what it yields vs. the
+        # diagnostics: the frame-UUID primary, with the old url tiers only as a fallback.
+        loc = {}
+        try:
+            loc = _capture_locator(page, fl, list_page_url)
+            if not loc.get("url"):
+                url, _list_ok = capture_campaign_url(page, fl, list_page_url, pacer, cfg)
+                loc["url"] = url
+        except Exception as e:
+            print(f"      locator capture raised: {type(e).__name__}: {e}")
+        rec = build_record(c, {"url": loc.get("url"), "campaign_id": loc.get("campaign_id"),
+                               "brief_url": loc.get("brief_url"),
+                               "frame_url": loc.get("frame_url")}, status="scraped")
+        print(f"      => campaign_id={rec.get('campaign_id')!r}")
+        print(f"         url        ={rec.get('url')!r}")
+        print(f"         frame_url  ={rec.get('frame_url')!r}")
+        print(f"         brief_url  ={rec.get('brief_url')!r}")
+        print(f"         locator_missing={rec.get('locator_missing')}")
+
+        try:
+            close_detail(page, fl)
+        except Exception:
+            pass
+        records.append(rec)
+        pacer.page_delay()
+
+    out = Path("campaigns_test.json")
+    payload = {
+        "generated_at": _now_iso(),
+        "note": "THROWAWAY --test-capture diagnostic (URL capture only). Not a real run; "
+                "the real campaigns.json was NOT touched.",
+        "count": len(records), "campaigns": records,
+    }
+    out.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    print("\n== locator-capture summary ==")
+    got = sum(1 for r in records if r.get("campaign_id"))
+    got_brief = sum(1 for r in records if r.get("brief_url"))
+    missing = sum(1 for r in records if r.get("locator_missing"))
+    for r in records:
+        flag = "MISSING" if r.get("locator_missing") else "ok"
+        print(f"  [{flag:^7}] {(r.get('name') or '?')[:34]:34}  "
+              f"id={r.get('campaign_id') or '-'}")
+        print(f"            url  ={r.get('url') or '(none)'}")
+        print(f"            brief={r.get('brief_url') or '(none)'}")
+    print(f"\n  {got}/{len(records)} captured a campaign_id (UUID); "
+          f"{got_brief}/{len(records)} captured a brief_url; {missing} locator_missing.")
+    print("  NOTE: `url` is built as https://whop.com/discover/app/<app_id>/<UUID>; `frame_url`\n"
+          "  is the raw apps.whop.com route the campaign actually loaded. If the built url\n"
+          "  doesn't open the campaign directly in a browser, the frame_url is canonical —\n"
+          "  tell me which resolves and I'll store that one.")
+    print(f"  Wrote {out} — the real campaigns.json was NOT touched.")
+    print(f"  Per-campaign dialog HTML dumped to probe_capture_1..{len(records)}.html.")
+
+
+# --- main ----------------------------------------------------------------------
+def main():
+    cfg = CONFIG
+    parser = argparse.ArgumentParser(description="Scout — personal Whop Content Rewards scraper.")
+    parser.add_argument("--force", action="store_true", help="ignore the 20h once-daily guard")
+    parser.add_argument("--refresh", action="store_true", help="full re-scrape of every campaign")
+    parser.add_argument("--probe", action="store_true", help="confirm selectors: screenshot + dump DOM")
+    parser.add_argument("--test-capture", nargs="?", type=int, const=5, default=None, metavar="N",
+                        help="THROWAWAY diagnostic: scrape only the first N campaigns (default 5) "
+                             "through the full detail-modal path to exercise URL capture on the "
+                             "real DOM; writes campaigns_test.json (NOT campaigns.json), prints a "
+                             "capture summary, and does NO ranking / footage / proven-clips work")
+    parser.add_argument("--mark-done", nargs="+", metavar="CAMPAIGN_ID",
+                        help="mark campaign id(s) as clipper-completed (DONE list — excluded "
+                             "from future scraping AND ranking), then exit")
+    parser.add_argument("--unmark-done", nargs="+", metavar="CAMPAIGN_ID",
+                        help="remove campaign id(s) from the DONE list, then exit")
+    args = parser.parse_args()
+
+    # DONE-list bookkeeping — pure file edits, no browser. Handle and exit.
+    if args.mark_done or args.unmark_done:
+        if args.mark_done:
+            done = update_completed(cfg.completed_path, args.mark_done)
+            print(f"Marked {len(args.mark_done)} campaign(s) DONE.")
+        if args.unmark_done:
+            done = update_completed(cfg.completed_path, args.unmark_done, remove=True)
+            print(f"Removed {len(args.unmark_done)} campaign(s) from DONE.")
+        print(f"DONE list now has {len(done)} campaign(s) -> {cfg.completed_path}")
+        return
+
+    state = State(cfg.state_path)
+
+    # Once-daily guard (skipped for probe + the throwaway --test-capture diagnostic).
+    if not args.probe and args.test_capture is None:
+        hrs = state.hours_since_last_run()
+        if hrs is not None and hrs < cfg.min_hours_between_runs and not args.force:
+            wait = cfg.min_hours_between_runs - hrs
+            print(f"Last run was {hrs:.1f}h ago. Once-daily guard: wait ~{wait:.1f}h "
+                  f"or pass --force. Not today — browse manually if you like.")
+            return
+
+    profile = Path(cfg.profile_dir)
+    first_run = not profile.exists() or not any(profile.iterdir()) if profile.exists() else True
+
+    pacer = Pacer(
+        base_delay=cfg.base_delay, fast_delay=cfg.fast_delay, fast_chance=cfg.fast_chance,
+        afk_every=cfg.afk_every, afk_break=cfg.afk_break,
+        long_afk_chance=cfg.long_afk_chance, long_afk_break=cfg.long_afk_break,
+        revisit_chance=cfg.revisit_chance, scroll_step=cfg.scroll_step,
+        scroll_pause=cfg.scroll_pause,
+    )
+
+    with Session(profile_dir=cfg.profile_dir, viewport=cfg.viewport, headful=True) as session:
+        ensure_logged_in(session, first_run, pacer, always_prompt=args.probe)
+
+        if args.probe:
+            run_probe(session, pacer)
+            return
+
+        if args.test_capture is not None:
+            run_test_capture(session, pacer, cfg, args.test_capture)
+            return
+
+        page = session.page
+        start = time.monotonic()
+        deadline_ts = start + cfg.max_minutes * 60
+        errors_before = _count_errors(cfg.errors_path)
+
+        stopped_reason = None
+        results, new_ids, skipped = [], [], []
+        cards = []
+        completed_ids = load_completed(cfg.completed_path)
+        if completed_ids:
+            print(f"  DONE list: {len(completed_ids)} clipper-completed campaign(s) will be "
+                  f"skipped from scraping + ranking.")
+        try:
+            cards = collect_cards(page, pacer, cfg, deadline_ts)
+            # Load prior campaigns BEFORE pre-filtering so known campaigns can bypass the
+            # gate (they cost no session budget and must not be demoted out of the rankings).
+            prev_by_id = load_prev_campaigns(cfg.campaigns_path)
+            # Only campaigns we hold REAL detail for are exempt (card-only stubs stay subject
+            # to the looser pre-filter so they can be re-evaluated and actually scraped).
+            known_detail_ids = [cid for cid, r in prev_by_id.items() if _has_cached_detail(r)]
+            survivors, skipped_pairs = prefilter(cards, cfg, known_ids=known_detail_ids)
+            skipped = [card_only_record(c, "skipped_prefilter", r) for c, r in skipped_pairs]
+            print(f"  Pre-filter: {len(survivors)} survivors, {len(skipped)} skipped "
+                  f"(known campaigns exempt).")
+
+            fl = get_app_frame_locator(page)  # still on the list; cards clicked here
+            results, new_ids = run_detail_pass(
+                page, fl, survivors, prev_by_id, state, pacer, cfg, deadline_ts,
+                args.refresh, completed_ids
+            )
+
+            # Derive every analysis dimension (min-payout, max-payout, views-per-
+            # submission, category, disqualifiers, competition, age/velocity, trends).
+            # prev_rec drives cross-run trends + first_seen.
+            for rec in results:
+                enrich_active(rec, cfg, prev_rec=prev_by_id.get(rec.get("id")))
+                rec["pre_score"] = pre_score(rec)
+            # FOOTAGE SUBSTANCE INTAKE — runs FIRST (accessibility is a hard disqualifier,
+            # so an undownloadable-footage campaign is sunk before we spend effort on it).
+            # Judges what I'd actually be clipping, not just the stats. Cached per campaign.
+            intake_mod.probe_campaigns(results, cfg, pacer)
+            social_mod.probe_sources(results, cfg.social_top_n, pacer)
+            footage_mod.probe_campaigns(results, cfg.footage_top_n, pacer)
+            # Measure repeatable clippability from dedicated clipper accounts. Runtime
+            # is unlimited, so analyze EVERY non-disqualified campaign (not a top-N):
+            # this is a top-two ranking lever and coverage matters more than speed.
+            clips_mod.probe_campaigns(results, cfg, pacer)
+        except StopRun as e:
+            stopped_reason = str(e)
+            print(f"\n!! STOP: {e}. Saving progress and exiting. Not today — browse manually.")
+            prev_by_id = load_prev_campaigns(cfg.campaigns_path)
+
+        seen_ids = [c["id"] for c in cards if c.get("id")]
+        all_records = assemble(results, skipped, prev_by_id, seen_ids, completed_ids)
+
+        report.write_json(cfg.campaigns_path, all_records)
+        report.write_summary_md(cfg.summary_path, all_records)
+        state.finish_run()
+
+        report.terminal_report(
+            all_records,
+            db_total=state.known_count,
+            new_count=len(new_ids),
+            failures=_count_errors(cfg.errors_path) - errors_before,
+        )
+        if stopped_reason:
+            print(f"\n(Run ended early: {stopped_reason})")
+
+
+def _count_errors(path):
+    p = Path(path)
+    if not p.exists():
+        return 0
+    try:
+        return sum(1 for _ in p.open(encoding="utf-8"))
+    except Exception:
+        return 0
+
+
+if __name__ == "__main__":
+    main()
