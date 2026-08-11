@@ -48,11 +48,15 @@ CATEGORIES = [
 ]
 _CATEGORY_SET = set(CATEGORIES)
 
-GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
-# Bump whenever the prompt logic changes (build_batch_prompt). A cache written under a
-# different version is auto-discarded so old labels (e.g. the pre-fix brand_product bloat)
-# don't persist — the fix takes effect on the next normal run, no --recategorize needed.
-PROMPT_VERSION = 2
+# Categorization is a SIMPLE classification task (far cheaper than caption writing), so the
+# small/fast model is the default — it uses a fraction of the daily token budget. Override with
+# cfg.category_model or $GROQ_MODEL="llama-3.3-70b-versatile" if 8B accuracy proves poor.
+GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
+# Recorded in the cache for provenance only. We do NOT discard the cache on a version change —
+# re-categorizing all ~450 campaigns every run is what blew the free-tier DAILY token budget.
+# Cached categorizations are always kept; only UNCACHED campaigns are sent to Groq. To force a
+# fresh pass under a new prompt, use `--recategorize` (which is quota-aware via the per-run cap).
+PROMPT_VERSION = 3
 _MODAL_CAP = 800        # chars of modal_requirements_text fed to the model (keep prompts small)
 _MAX_TITLES = 5         # footage/resource titles per campaign (task: first 3–5)
 
@@ -240,12 +244,50 @@ def _groq_client():
         return None
 
 
-def _groq_chat(client, system, user, model, *, retries=8, max_tokens=2048):
-    """One chat completion with rate-limit backoff. A 429 (RPM/TPM on the free tier) is
-    transient: honor Groq's 'try again in Xs' hint exactly when present, else exponential
-    backoff with jitter (capped). Returns the message string, or None on a non-transient
-    failure / exhausted retries. Mirrors the sibling clipper's groq_chat, but more patient
-    (higher retries + honored hints) since we fire many batches back-to-back."""
+class GroqDailyLimit(Exception):
+    """Raised when Groq's DAILY token/request budget is exhausted (TPD/RPD, or a 'try again'
+    hint longer than a per-minute window). Retrying is pointless — the day's quota is gone — so
+    this propagates up and stops Groq calls for the rest of the run (remainder → keyword)."""
+
+
+# A required wait longer than this is a daily cap, not a per-minute one — not worth blocking
+# a run for. Per-minute waits are seconds; daily waits are minutes/hours.
+_MAX_MINUTE_WAIT_S = 90.0
+
+
+def _parse_wait_seconds(msg):
+    """Seconds from a Groq 'try again in 5m30s' / '8.5s' / '2h34m' hint, or None."""
+    m = re.search(r"try again in ([0-9hms.\s]+)", msg, re.I)
+    if not m:
+        return None
+    total, found = 0.0, False
+    for val, unit in re.findall(r"([\d.]+)\s*(h|m|s)", m.group(1), re.I):
+        found = True
+        total += float(val) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+    return total if found else None
+
+
+def _classify_rate_limit(msg):
+    """('daily' | 'minute' | 'error', wait_seconds_or_None). 'daily' = TPD/RPD/'per day' or a
+    wait longer than a per-minute window (retrying can't help today). 'minute' = a short,
+    recoverable per-minute (TPM/RPM) limit. 'error' = a non-rate failure."""
+    low = msg.lower()
+    is_rate = ("429" in msg or "rate limit" in low or "rate_limit" in low
+               or "tpm" in low or "tpd" in low or "rpm" in low or "rpd" in low)
+    if not is_rate:
+        return "error", None
+    wait = _parse_wait_seconds(msg)
+    is_daily = ("per day" in low or "tpd" in low or "rpd" in low or "daily" in low
+                or (wait is not None and wait > _MAX_MINUTE_WAIT_S))
+    return ("daily" if is_daily else "minute"), wait
+
+
+def _groq_chat(client, system, user, model, *, retries=3, max_tokens=2048):
+    """One chat completion. A per-minute rate limit (TPM/RPM) is transient: honor Groq's
+    'try again in Xs' hint (short), retry a FEW times, else fall back. A DAILY limit
+    (TPD/RPD, or a very long wait) raises GroqDailyLimit immediately — retrying into a dead
+    daily quota only hangs the run. Returns the message string, or None on other failure /
+    exhausted retries. Retries are deliberately modest (a daily budget, not a per-minute one)."""
     for attempt in range(retries + 1):
         try:
             resp = client.chat.completions.create(
@@ -259,16 +301,14 @@ def _groq_chat(client, system, user, model, *, retries=8, max_tokens=2048):
             return resp.choices[0].message.content or ""
         except Exception as e:
             msg = str(e)
-            is_rate = "429" in msg or "rate" in msg.lower() or "tpm" in msg.lower()
-            if is_rate and attempt < retries:
-                m = re.search(r"try again in ([\d.]+)\s*s", msg)
-                if m:
-                    wait = float(m.group(1)) + 0.5                 # honor Groq's hint exactly
-                else:
-                    wait = min(2.0 ** attempt, 30.0) + random.uniform(0, 1.5)
-                print(f"    Groq rate limit — waiting {wait:.1f}s "
+            kind, wait = _classify_rate_limit(msg)
+            if kind == "daily":
+                raise GroqDailyLimit(msg.splitlines()[0][:200])
+            if kind == "minute" and attempt < retries:
+                w = (wait + 0.5) if wait else min(2.0 ** attempt, 20.0) + random.uniform(0, 1.0)
+                print(f"    Groq per-minute limit — waiting {w:.1f}s "
                       f"(attempt {attempt + 1}/{retries})…")
-                time.sleep(wait)
+                time.sleep(w)
                 continue
             print(f"    Groq call failed ({model}): {msg.splitlines()[0][:160]}")
             return None
@@ -285,18 +325,18 @@ def _categorize_batch(client, signals_list, model):
     return parse_batch_response(raw, len(signals_list))
 
 
-def _categorize_batch_retry(client, signals_list, model, *, batch_retries=2, cooldown=12.0):
-    """`_categorize_batch` plus WHOLE-BATCH retries: if a batch fails even after `_groq_chat`'s
-    own per-call backoff (sustained rate-limit), cool down longer and try the whole batch again
-    before giving up. This is what drives fallback toward zero — a batch only falls back to the
-    keyword tagger after every retry is exhausted."""
+def _categorize_batch_retry(client, signals_list, model, *, batch_retries=1, cooldown=8.0):
+    """`_categorize_batch` plus a FEW whole-batch retries for a transient per-minute failure.
+    A GroqDailyLimit is NOT caught here — it propagates so the run stops calling Groq (no point
+    retrying a dead daily quota). Kept modest (default 1 retry): the budget is daily, so
+    hammering wastes the run's time, and unfinished campaigns simply defer to the next run."""
     for attempt in range(batch_retries + 1):
-        res = _categorize_batch(client, signals_list, model)
+        res = _categorize_batch(client, signals_list, model)   # may raise GroqDailyLimit
         if res is not None:
             return res
         if attempt < batch_retries:
             wait = cooldown * (attempt + 1)
-            print(f"    Batch failed — cooling down {wait:.0f}s then retrying whole batch "
+            print(f"    Batch failed — cooling down {wait:.0f}s then retrying "
                   f"({attempt + 1}/{batch_retries})…")
             time.sleep(wait)
     return None
@@ -313,11 +353,11 @@ def _load_cache(path):
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    # Keep ALL valid cached categorizations regardless of prompt_version — re-categorizing
+    # everything on a version bump is exactly what blew the daily budget. Only genuinely
+    # uncached campaigns are sent to Groq (see categorize_campaigns); --recategorize is the
+    # explicit, quota-capped way to refresh under a new prompt.
     if isinstance(data, dict) and "entries" in data:
-        if data.get("prompt_version") != PROMPT_VERSION:
-            print(f"  Categorizer: cache prompt_version {data.get('prompt_version')} != "
-                  f"{PROMPT_VERSION} — discarding stale categories, re-categorizing.")
-            return {}
         entries = data.get("entries")
         return entries if isinstance(entries, dict) else {}
     return data if isinstance(data, dict) else {}   # legacy bare-dict cache -> reuse
@@ -429,30 +469,61 @@ def categorize_campaigns(records, cfg, *, recategorize=False, client=None, sampl
             for r, _sig, _h in todo:
                 _apply(r, keyword_result(r), source="keyword_fallback")
         else:
+            # Per-run cap: only send up to N NEW campaigns to Groq this run so a first big fill
+            # can't exceed the free-tier DAILY budget. The rest keep keyword_fallback (NOT
+            # cached) and are picked up on the next run — Scout runs every few days, so the
+            # board fills in over a couple runs without ever blowing the quota.
+            cap = getattr(cfg, "category_max_new_per_run", 120)
+            to_groq, over_cap = todo, []
+            if cap and cap > 0 and len(todo) > cap:
+                to_groq, over_cap = todo[:cap], todo[cap:]
+                print(f"  Categorizer: per-run cap {cap} — categorizing {len(to_groq)} new now, "
+                      f"deferring {len(over_cap)} to a later run (daily-budget friendly).")
+            for r, _sig, _h in over_cap:
+                _apply(r, keyword_result(r), source="keyword_fallback")
+
             bs = max(1, getattr(cfg, "category_batch_size", 20))
             pause = max(0.0, getattr(cfg, "category_batch_pause", 2.0))
-            batch_retries = max(0, getattr(cfg, "category_batch_retries", 2))
-            chunks = [todo[i:i + bs] for i in range(0, len(todo), bs)]
-            done, fell_back = 0, 0
+            batch_retries = max(0, getattr(cfg, "category_batch_retries", 1))
+            chunks = [to_groq[i:i + bs] for i in range(0, len(to_groq), bs)]
+            done, transient_fb, daily_hit, daily_msg, stopped_at = 0, 0, False, "", None
+
             for bi, chunk in enumerate(chunks):
-                results = _categorize_batch_retry(
-                    client, [s for _r, s, _h in chunk], model, batch_retries=batch_retries)
+                try:
+                    results = _categorize_batch_retry(
+                        client, [s for _r, s, _h in chunk], model, batch_retries=batch_retries)
+                except GroqDailyLimit as e:             # daily quota gone — stop calling Groq
+                    daily_hit, daily_msg, stopped_at = True, str(e), bi
+                    break
                 for j, (r, _sig, h) in enumerate(chunk):
-                    if results is None:                 # exhausted retries — keyword fallback
+                    if results is None:                 # transient failure exhausted — defer
                         _apply(r, keyword_result(r), source="keyword_fallback")
-                        fell_back += 1
+                        transient_fb += 1
                     else:
-                        res = results[j]
-                        cache[h] = res                  # cache ONLY real Groq results
-                        _apply(r, res, source="groq")
+                        cache[h] = results[j]           # cache ONLY real Groq results
+                        _apply(r, results[j], source="groq")
                 done += len(chunk)
-                print(f"    categorized {done}/{len(todo)} "
+                print(f"    categorized {done}/{len(to_groq)} "
                       f"({'groq' if results is not None else 'FALLBACK'})")
-                if pause and bi < len(chunks) - 1:      # pace to stay under RPM (not after last)
+                if pause and bi < len(chunks) - 1:      # pace to stay under per-minute RPM
                     time.sleep(pause)
-            if fell_back:
-                print(f"  Categorizer: {fell_back} campaign(s) still fell back to keyword after "
-                      f"retries (Groq rate limits). Re-run to pick them up (cached ones skip).")
+
+            # Everything Groq didn't reach (daily stop) → keyword_fallback, deferred to next run.
+            deferred_daily = 0
+            if stopped_at is not None:
+                for chunk in chunks[stopped_at:]:
+                    for r, _sig, _h in chunk:
+                        _apply(r, keyword_result(r), source="keyword_fallback")
+                        deferred_daily += 1
+            if daily_hit:
+                print(f"  Groq daily limit likely reached ({daily_msg[:100]}) — "
+                      f"{deferred_daily} campaign(s) deferred to next run. NOT retrying (the "
+                      f"quota is per-DAY, not per-minute).")
+            deferred_total = len(over_cap) + deferred_daily
+            if deferred_total or transient_fb:
+                print(f"  Categorizer: deferred {deferred_total} (cap {len(over_cap)} + daily "
+                      f"{deferred_daily}) + {transient_fb} transient fallback(s) → next run "
+                      f"(uncached, will retry; cached ones skip Groq).")
 
     _write_cache(path, cache, model)
     _print_sample(active, sample_n)

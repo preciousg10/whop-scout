@@ -107,7 +107,11 @@ class Config:
     category_batch_size: int = 20             # campaigns per Groq call (free-tier friendly)
     category_model: str = None                # None -> $GROQ_MODEL or llama-3.3-70b-versatile
     category_batch_pause: float = 2.0         # seconds between Groq batches (stay under RPM)
-    category_batch_retries: int = 2           # whole-batch retries (after a cooldown) before fallback
+    category_batch_retries: int = 1           # whole-batch retries before fallback (daily budget: fail fast)
+    # Per-run cap on NEW (uncached) campaigns sent to Groq — protects the free-tier DAILY token
+    # budget on a first big fill. The rest keep keyword_fallback and are picked up next run;
+    # Scout runs every few days, so the board fills in over a couple runs within the free tier.
+    category_max_new_per_run: int = 120
 
     # proven-clips / repeatable-clippability (the heavy new ranking lever).
     # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
