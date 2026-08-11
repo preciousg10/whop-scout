@@ -644,6 +644,12 @@ _ANALYSIS_DEFAULTS = {
     # public Notion page's rules.
     "rules_readable": None, "rules_source": None, "rules_unreadable": False,
     "rules_unreadable_reason": None, "notion_rules_text": None,
+    # Prohibited/vice category exclusion (gambling/betting/casino/alcohol/vape/…). Like
+    # rules_unreadable, excluded_prohibited=True REMOVES the campaign from the ranked output
+    # the clipper reads (kept in campaigns.json, segregated in the report with the reason);
+    # _borderline flags an ambiguous-keyword-only match for the user to eyeball.
+    "excluded_prohibited": False, "excluded_prohibited_reason": None,
+    "excluded_prohibited_borderline": False,
 }
 
 

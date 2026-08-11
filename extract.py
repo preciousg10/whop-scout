@@ -351,6 +351,94 @@ def detect_disqualifiers(text, platforms=None, source_links=None, join_cta=None)
     return out
 
 
+# --- prohibited (vice) category exclusion --------------------------------------
+# Betting/gambling/casino/sportsbook, alcohol/drinking, vape/nicotine and similar vice
+# categories are AUTO-EXCLUDED from the ranked output (mirrors the rules_unreadable
+# exclusion): kept in campaigns.json flagged excluded_prohibited, segregated in the report,
+# and skipped by the clipper's pickcampaign — NOT merely sunk to composite 0 like the
+# gambling disqualifier. Detected across the campaign NAME, CATEGORY and on-modal
+# requirements TEXT. These three lists are the config knob — EXTEND them to broaden coverage.
+#
+# STRONG terms: unambiguous — a single hit is a clear disqualification.
+PROHIBITED_TERMS_STRONG = [
+    "casino", "gambling", "sportsbook", "sports betting", "roulette", "blackjack",
+    "baccarat", "slot machine", "online slots", "betting site", "betting app",
+    "place a bet", "place bets", "parlay", "parlays", "wager", "wagering",
+    "bookmaker", "sweepstakes", "crash game", "plinko",
+    "alcohol", "alcoholic", "liquor", "whiskey", "whisky", "vodka", "tequila",
+    "bourbon", "brewery", "distillery", "hard seltzer",
+    "vape", "vaping", "e-cigarette", "e-cig", "nicotine",
+]
+# WEAK terms: real in a vice context but also occur innocently (bet/stake/odds/drink…).
+# A hit here ALONE is treated as BORDERLINE — still excluded, but flagged for review so a
+# false positive is surfaced, never silently kept.
+PROHIBITED_TERMS_WEAK = [
+    "bet", "bets", "betting", "gamble", "odds", "stake", "stakes", "poker",
+    "drinking", "drink", "beer", "wine", "seltzer",
+]
+# Known vice BRANDS — a match anywhere is a clear disqualification regardless of copy.
+PROHIBITED_BRANDS = [
+    "roobet", "stake.com", "stake.us", "creator casino", "fliff", "bet365",
+    "1xbet", "draftkings", "fanduel", "betmgm", "caesars sportsbook", "bovada",
+    "rollbit", "duelbits", "gamdom", "csgoroll", "prizepicks", "underdog fantasy",
+    "chumba casino", "pulsz", "high 5 casino", "shuffle.com", "bc.game", "betway",
+]
+
+
+def _compile_prohibited(terms):
+    # Word-ish boundaries via lookarounds: embedded dots (stake.com) still match cleanly,
+    # while substrings never false-fire ('bet' must not hit 'abet'/'sherbet'/'bet365').
+    return [(t, re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)", re.I)) for t in terms]
+
+
+_PROHIBITED_BRAND_RX = _compile_prohibited(PROHIBITED_BRANDS)
+_PROHIBITED_STRONG_RX = _compile_prohibited(PROHIBITED_TERMS_STRONG)
+_PROHIBITED_WEAK_RX = _compile_prohibited(PROHIBITED_TERMS_WEAK)
+
+
+def detect_prohibited_category(name=None, category=None, text=None):
+    """Detect a prohibited/vice campaign (gambling/betting/casino/sportsbook, alcohol/
+    drinking, vape/nicotine, or a known vice brand) from the campaign NAME, CATEGORY and
+    on-modal requirements TEXT. Returns None when clean, else a dict:
+        {reason, matched: [term, ...], borderline: bool, sources: [field, ...]}.
+
+    Conservative by design: an unambiguous keyword (casino/sportsbook/alcohol/vape…) or a
+    known brand (Roobet/Fliff/Creator Casino…) is a CLEAR disqualification. An ambiguous
+    keyword alone (bet/stake/odds/drink — also innocent) is flagged BORDERLINE: still
+    excluded, but surfaced for review so a false positive isn't hidden, never silently kept.
+    Pure/testable — no network. Keyword/brand lists are the PROHIBITED_* module constants."""
+    fields = {"name": name or "", "category": category or "", "requirements": text or ""}
+
+    def scan(patterns):
+        hits, srcs = [], set()
+        for term, rx in patterns:
+            for field, val in fields.items():
+                if val and rx.search(val):
+                    hits.append(term)
+                    srcs.add(field)
+                    break
+        return hits, srcs
+
+    brand_hits, brand_src = scan(_PROHIBITED_BRAND_RX)
+    strong_hits, strong_src = scan(_PROHIBITED_STRONG_RX)
+    weak_hits, weak_src = scan(_PROHIBITED_WEAK_RX)
+    if not (brand_hits or strong_hits or weak_hits):
+        return None
+
+    borderline = not (brand_hits or strong_hits)   # only ambiguous keywords matched
+    sources = sorted(brand_src | strong_src | weak_src)
+    if brand_hits:
+        lead = "matched prohibited brand " + ", ".join(f"'{b}'" for b in brand_hits)
+    elif strong_hits:
+        lead = "matched " + ", ".join(f"'{t}'" for t in strong_hits)
+    else:
+        lead = "ambiguous vice keyword " + ", ".join(f"'{t}'" for t in weak_hits)
+    prefix = "prohibited category" + (" (BORDERLINE — review)" if borderline else "")
+    reason = f"{prefix}: {lead} (in {', '.join(sources)})"
+    return {"reason": reason, "matched": brand_hits + strong_hits + weak_hits,
+            "borderline": borderline, "sources": sources}
+
+
 def classify_openness(text, join_cta=None):
     """Is the campaign open to an instant free join? 'no' (application/selection-gated),
     'yes' (clearly open — anyone can join now), or 'unclear' (no explicit signal → neutral).
