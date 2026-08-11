@@ -611,6 +611,7 @@ def prefilter(cards, cfg, known_ids=None):
 # Fields filled by enrich_active()/passes later; None means "honestly unknown".
 _ANALYSIS_DEFAULTS = {
     "min_payout": None, "min_views_to_payout": None, "high_minimum": False,
+    "min_view_threshold": None,   # views a video must reach before ANY payout (distinct gate)
     "max_payout_per_video": None, "max_payout_uncapped": False,
     "participants_per_1k_budget": None,
     "category": None,
@@ -756,6 +757,13 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["min_payout"] = min_payout
     rec["min_views_to_payout"] = mv
     rec["high_minimum"] = mv is not None and mv > cfg.min_payout_max_views
+
+    # minimum-VIEW payout gate (DISTINCT from the min-payout-DOLLAR above): some campaigns pay
+    # $0 until a single video crosses a hard VIEW count ("VIDEO MUST REACH 10K FOR PAYOUT").
+    # Brutal for a new/low-view account, so it feeds a strong composite penalty scaling with
+    # the threshold. Reads the on-modal requirements text as well as the rules bullets.
+    mv_text = " ".join(t for t in (rules, rec.get("modal_requirements_text")) if t)
+    rec["min_view_threshold"] = extract.parse_min_view_threshold(mv_text)
 
     # max payout per video
     mp = extract.parse_max_payout(rules)

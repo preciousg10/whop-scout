@@ -68,6 +68,9 @@ def _warning_flags(c):
         flags.append("BELOW-MIN-PAYOUT (typical clip earns $0)")
     if c.get("high_minimum"):
         flags.append("HIGH_MINIMUM")
+    mvt = c.get("min_view_threshold")
+    if mvt:
+        flags.append(f"MIN-VIEW-THRESHOLD (needs {mvt:,} views before ANY payout)")
     ct = c.get("content_type") or {}
     if ct.get("type") and ct.get("standard") is False:
         flags.append(f"non-standard footage ({ct['type']})")
@@ -403,6 +406,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
     active.sort(key=lambda c: (_composite_of(c), _core_known(c), c.get("pre_score", 0)),
                 reverse=True)
     high_min = sum(1 for c in active if c.get("high_minimum"))
+    min_view_gated = sum(1 for c in active if c.get("min_view_threshold"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
 
@@ -420,6 +424,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
     print(f"  Known, refreshed no re-scrape        : {refreshed}")
     print(f"  Clipper-done (DONE list, excluded)   : {completed}")
     print(f"  Flagged HIGH_MINIMUM                 : {high_min}")
+    print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")
     print("")

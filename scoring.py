@@ -73,6 +73,14 @@ HIGH_MINIMUM_PENALTY = 0.3
 # the views needed to reach a campaign's minimum payout, a typical clip earns $0 — penalize
 # hard. Only fires when both numbers are known (never guessed).
 EXPECTED_BELOW_MIN_PENALTY = 0.15
+# Minimum-VIEW payout gate (DISTINCT from the dollar minimum above): views a single video
+# must reach before ANY payout ("VIDEO MUST REACH 10K FOR PAYOUT"). Brutal for a zero-audience
+# start — a typical early clip never clears the gate and earns $0 — so the penalty scales hard
+# with the threshold: ~0.6x at 1K, ~0.12x (SEVERE) at 10K, ~0.04x at 50K+. None -> neutral 1.0.
+MIN_VIEW_THRESHOLD_POINTS = [
+    (100, 0.95), (500, 0.85), (1000, 0.60), (2500, 0.40),
+    (5000, 0.25), (10000, 0.12), (25000, 0.06), (50000, 0.04),
+]
 # Repeatable-clippability multiplier range: score 0 -> 0.5x, 0.5 -> 1.5x, 1 -> 2.5x.
 # A 5x dynamic range makes this the heaviest single lever, as intended.
 REPEATABLE_MIN_FACTOR = 0.5
@@ -223,6 +231,16 @@ def max_payout_factor(max_payout, uncapped):
     if max_payout >= MAX_PAYOUT_FLOOR:
         return 1.0
     return round(max(0.4, max_payout / MAX_PAYOUT_FLOOR), 4)
+
+
+def min_view_threshold_factor(threshold):
+    """Penalty for a minimum-VIEW payout gate (views a single video must reach before ANY
+    payout). Scales hard with the gate — ~0.6x at 1K, ~0.12x (SEVERE) at 10K, ~0.04x at 50K+ —
+    because a zero-audience start rarely clears it, so a typical clip earns $0. None/0 ->
+    neutral 1.0 (unknown/no gate), never guessed."""
+    if not threshold or threshold <= 0:
+        return 1.0
+    return round(_interp_log(threshold, MIN_VIEW_THRESHOLD_POINTS), 4)
 
 
 # --- payout velocity -----------------------------------------------------------
@@ -630,6 +648,11 @@ def composite_score(c):
     below_min = evpc is not None and mvtp is not None and evpc < mvtp
     below_min_penalty = EXPECTED_BELOW_MIN_PENALTY if below_min else 1.0
 
+    # Minimum-VIEW payout gate (distinct from the dollar minimum): a hard view count a video
+    # must reach before ANY payout — brutal for a new account. Penalty scales with the gate.
+    mvt = c.get("min_view_threshold")
+    mvt_fac = min_view_threshold_factor(mvt)
+
     rep_factor, rep_score, rep_conf = repeatable_factor(c)
 
     # supporting levers
@@ -682,7 +705,7 @@ def composite_score(c):
     # views dominate rate. Expected-earnings-per-clip (reach × rate) is a heavy top lever.
     base = rem * clip * reach_fac * pay_fac
     composite = round(
-        base * confidence_factor * minimum_penalty * below_min_penalty
+        base * confidence_factor * minimum_penalty * below_min_penalty * mvt_fac
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
         * ctype_fac * supply_fac * density_fac * access_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
@@ -712,6 +735,9 @@ def composite_score(c):
         # strict minimum-payout gate on PROVEN expected views (typical clip earns $0)
         "expected_below_minimum": below_min,
         "expected_below_min_penalty": below_min_penalty,
+        # minimum-VIEW payout gate — hard view count a video must clear before ANY payout
+        "min_view_threshold": mvt,
+        "min_view_threshold_factor": mvt_fac,
         # repeatable-clippability — THE clip-quality lever (replaces views-per-submission)
         "repeatable_score": rep_score,
         "repeatable_confidence": rep_conf,

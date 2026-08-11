@@ -178,6 +178,66 @@ def min_views_to_payout(min_payout, pay_per_1k):
     return (min_payout / pay_per_1k) * 1000.0
 
 
+# --- minimum-VIEW payout threshold ---------------------------------------------
+# DISTINCT from the minimum-payout-DOLLAR above: some campaigns pay NOTHING until a single
+# video crosses a hard VIEW count — "VIDEO MUST REACH 10K FOR PAYOUT" (TraxNYC), "minimum
+# 10,000 views to be paid", "10K views required for payout". For a new / zero-audience
+# account this is brutal: a typical early clip never reaches the gate and earns $0, so scoring
+# penalizes it hard. We fire ONLY when explicit gating language ("must reach", "minimum",
+# "... for payout", "... to be paid", "... required") sits next to a view count, so a pay rate
+# ("$1 / 1K views") or a dollar minimum is NEVER misread as a view gate.
+_MIN_VIEW_FLOOR = 100          # ignore sub-100 stray numbers ("reach 5 views")
+# A number preceded by "per", "/", or "$" is a RATE or dollar figure, not a view gate.
+_RATE_PRECEDER_RE = re.compile(r"(?:per|/|\$)\s*$", re.I)
+_VIEWS = r"(?:views?|view\s+count)"
+_MV_BEFORE = (r"(?:must\s+(?:reach|hit|get|have|receive)|minimum(?:\s+of)?|min\.?|"
+              r"at\s+least|reach(?:es)?|need(?:s|ed)?|require[sd]?|threshold(?:\s+of)?)")
+_MV_AFTER = (r"(?:for\s+payout|to\s+(?:be\s+paid|get\s+paid|qualify|cash\s*out|withdraw|"
+             r"payout|earn|count|be\s+eligible)|before\s+payout|required|minimum)")
+_MV_PAYOUT_CTX = (r"(?:for\s+payout|to\s+(?:be|get)\s+paid|before\s+payout|"
+                  r"to\s+(?:qualify|payout|earn|count|be\s+eligible)|payout)")
+_MIN_VIEW_PATTERNS = (
+    # A: gating word, then "<num> views"  — "must reach 10K views", "minimum 10,000 views"
+    _MV_BEFORE + r"\s+(?:of\s+)?([0-9][0-9.,]*)\s*([kKmMbB]?)\s*" + _VIEWS,
+    # B: "<num> views", then gating word  — "10K views for payout", "10k views required"
+    r"([0-9][0-9.,]*)\s*([kKmMbB]?)\s*" + _VIEWS + r"[^.\n]{0,25}?" + _MV_AFTER,
+    # C: gating word, then "<num>K/M" with views IMPLIED (no "views" word, not $/followers),
+    #    then payout context — catches "MUST REACH 10K FOR PAYOUT" (unit is mandatory here).
+    _MV_BEFORE + r"\s+([0-9][0-9.,]*)\s*([kKmMbB])\b(?!\s*(?:follow|sub|dollar|usd))"
+    r"[^.\n]{0,20}?" + _MV_PAYOUT_CTX,
+)
+
+
+def _views_to_int(numstr, unit):
+    try:
+        n = float(str(numstr).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    mult = {"k": 1e3, "m": 1e6, "b": 1e9}.get((unit or "").lower(), 1)
+    return int(round(n * mult))
+
+
+def parse_min_view_threshold(text):
+    """Largest explicit MINIMUM-VIEW payout gate in free text — the view count a single video
+    must reach before ANY payout — or None. Fires only on explicit gating language next to a
+    view count and skips pay-rate phrasing ("per 1K views", "/1K views") and dollar figures,
+    so a rate or a min-payout-dollar is never read as a view gate. None when nothing matches —
+    never guessed. Returns the MAX matched gate (the harshest a clip must clear)."""
+    if not text:
+        return None
+    found = []
+    for pat in _MIN_VIEW_PATTERNS:
+        for m in re.finditer(pat, text, re.I):
+            num_start = m.start(1)
+            preceding = text[max(0, num_start - 12):num_start]
+            if _RATE_PRECEDER_RE.search(preceding):
+                continue  # "$1 per 1K views" / "/1K views" — a rate, not a gate
+            val = _views_to_int(m.group(1), m.group(2))
+            if val is not None and val >= _MIN_VIEW_FLOOR:
+                found.append(val)
+    return max(found) if found else None
+
+
 # --- max payout per video ------------------------------------------------------
 _MAX_UNCAPPED_RE = re.compile(
     r"\b(no\s+max(?:imum)?|no\s+cap|uncapped|unlimited\s+(?:earnings|payout|payouts)|"

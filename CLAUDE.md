@@ -48,12 +48,14 @@ python proven_clips.py "MrBeast" https://youtube.com/@MrBeast
 There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 (`parse_pay`, `parse_money`, `parse_remaining_fraction`, `parse_platforms`,
 `parse_int`, `campaign_id_from_url`, `parse_min_payout`, `min_views_to_payout`,
-`extract_handles`, `parse_max_payout`, `participants_per_1k_budget`, `payout_velocity`,
+`parse_min_view_threshold`, `extract_handles`, `parse_max_payout`,
+`participants_per_1k_budget`, `payout_velocity`,
 `detect_disqualifiers`, `classify_openness`, `classify_category`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
 (`pre_score`, `clippability`, `composite_score`, `pay_rate_factor`, `reach_factor`,
 `expected_earnings`, `earnings_factor`, `core_signals_known`, `data_confidence_factor`,
-`openness_factor`, `repeatable_factor`, `max_payout_factor`, `velocity_factor`/`_band`,
+`openness_factor`, `repeatable_factor`, `max_payout_factor`, `min_view_threshold_factor`,
+`velocity_factor`/`_band`,
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
 `action_density_factor`, `footage_access_factor`, `project_budget_drain`,
 `participant_growth`, `source_saturation_estimate`, `account_reusability`, and their
@@ -131,6 +133,15 @@ missing (`scoring.expected_earnings`), surfaced prominently in `campaigns_summar
 alongside the rate. The strict **minimum-payout gate** (`below_min_penalty` 0.15) fires
 when those PROVEN expected views fall below `min_views_to_payout` — a typical clip earns
 $0 — and only when both numbers are known.
+A DISTINCT **minimum-VIEW payout gate** (`min_view_threshold` / `min_view_threshold_factor`)
+handles campaigns that pay $0 until a single video crosses a hard VIEW count ("VIDEO MUST
+REACH 10K FOR PAYOUT"). `extract.parse_min_view_threshold` reads it from the modal
+requirements + rules text (explicit "must reach / minimum / … for payout / … to be paid"
+language next to a view count; pay rates like "$1/1K views" and dollar minimums are never
+misread as gates), and the penalty scales hard with the threshold — ~0.6× at 1K, ~0.12×
+(SEVERE) at 10K, ~0.04× at 50K+ — because a zero-audience start rarely clears it. Shown as a
+`MIN-VIEW-THRESHOLD` flag in the report. Unlike `below_min_penalty` it needs no proven-clipper
+data, so it fires as soon as the threshold is detected. UNKNOWN/no-gate → neutral 1.0.
 
 **Data-confidence factor (`data_confidence_factor` × `core_signals_known`).** Because every
 UNKNOWN maps to a neutral 1.0, a campaign with NO real data could float to the top on nothing
