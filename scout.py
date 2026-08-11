@@ -106,6 +106,8 @@ class Config:
     category_cache_path: str = "category_cache.json"  # per-content cache (skip Groq if unchanged)
     category_batch_size: int = 20             # campaigns per Groq call (free-tier friendly)
     category_model: str = None                # None -> $GROQ_MODEL or llama-3.3-70b-versatile
+    category_batch_pause: float = 2.0         # seconds between Groq batches (stay under RPM)
+    category_batch_retries: int = 2           # whole-batch retries (after a cooldown) before fallback
 
     # proven-clips / repeatable-clippability (the heavy new ranking lever).
     # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
