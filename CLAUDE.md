@@ -50,14 +50,15 @@ There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 `parse_int`, `campaign_id_from_url`, `parse_min_payout`, `min_views_to_payout`,
 `parse_min_view_threshold`, `references_resource_doc`, `extract_handles`, `parse_max_payout`,
 `participants_per_1k_budget`, `payout_velocity`,
-`detect_disqualifiers`, `classify_openness`, `classify_category`) are pure functions with no
+`detect_disqualifiers`, `classify_openness`, `classify_category`, `classify_categories`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
 (`pre_score`, `clippability`, `composite_score`, `pay_rate_factor`, `reach_factor`,
 `expected_earnings`, `earnings_factor`, `core_signals_known`, `data_confidence_factor`,
 `openness_factor`, `repeatable_factor`, `max_payout_factor`, `min_view_threshold_factor`,
 `velocity_factor`/`_band`,
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
-`action_density_factor`, `footage_access_factor`, `style_fit`, `project_budget_drain`,
+`action_density_factor`, `footage_access_factor`, `style_fit`, `rank_categories`,
+`project_budget_drain`,
 `participant_growth`, `source_saturation_estimate`, `account_reusability`, and their
 `*_factor` companions) and `social.parse_count` are likewise pure. `strategic.py`
 (`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
@@ -193,6 +194,21 @@ sinks but is shown in the report's DISQUALIFIED section with reasons. On top of 
 `composite_score` multiplies the six cross-run/strategic factors from `strategic.py` (budget
 drain, participant growth, source saturation, recurring creator, account reusability, and the
 neutral `performance_factor` stub) — see the "Cross-run + strategic signals" note above.
+
+**Category-level ranking (`scoring.rank_categories`, on top of per-campaign scoring — the
+per-campaign ranking is unchanged and still primary).** Each campaign is multi-tagged into
+ALL categories it fits (`extract.classify_categories` — a sports-podcast counts toward BOTH),
+stored on `rec["categories"]` (alongside the single-best `rec["category"]`). Every RANKABLE
+campaign then contributes its composite to each of its categories; a category's score is an
+aggregate of its members' composites, chosen by the `cfg.category_agg` knob
+(`top5` default | `top3` | `top10` | `average` | `best`; unknown → default). Only rankable
+campaigns count (`_is_rankable`: scraped/refreshed AND not disqualified / rules_unreadable /
+prohibited) — so existing exclusions are respected; the min-VIEW-threshold penalty is NOT an
+exclusion, it already lives in the composite, so a view-floored campaign still counts with its
+penalized score. A category with fewer than `CATEGORY_FULL_MIN` (5) members is flagged `thin`
+(its score rests on a small sample). The ranking (highest score first, each with
+count/thin/top campaigns) is written to `campaigns.json` (`category_ranking`), the summary MD
+("## Category ranking"), and the terminal report.
 
 **`enrich_active(rec, cfg, prev_rec)`** (in scout.py) fills, per active record: min-payout
 viability, `max_payout_per_video`/`uncapped`, `participants_per_1k_budget`, `category`

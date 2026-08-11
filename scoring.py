@@ -868,3 +868,77 @@ def composite_score(c):
         "composite": composite,
     }
     return composite, breakdown
+
+
+# =============================================================================
+# CATEGORY-LEVEL RANKING — on top of per-campaign scoring. Each ACTIVE campaign
+# contributes its composite to EVERY category it fits (multi-tag), and a category's
+# score aggregates its members. Per-campaign ranking is unchanged and still primary.
+# =============================================================================
+# How a category's score is aggregated from its members' composites. Numeric modes take the
+# top-N; "average" uses all members; "best" the single top. Config knob `category_agg`.
+CATEGORY_AGG_MODES = {"top3": 3, "top5": 5, "top10": 10, "average": None, "best": 1}
+CATEGORY_AGG_DEFAULT = "top5"
+# A category needs at least this many member campaigns to rank as "full"; fewer -> "thin"
+# (its score rests on a small sample, so it's flagged rather than trusted outright).
+CATEGORY_FULL_MIN = 5
+
+
+def _aggregate_category(scores_desc, agg):
+    """Aggregate a category's member composites (already sorted high->low) per `agg`.
+    Empty -> 0.0."""
+    if not scores_desc:
+        return 0.0
+    if agg == "average":
+        vals = scores_desc
+    elif agg == "best":
+        vals = scores_desc[:1]
+    else:
+        vals = scores_desc[:CATEGORY_AGG_MODES.get(agg, 5)]
+    return round(sum(vals) / len(vals), 6)
+
+
+def _is_rankable(c):
+    """A campaign that COUNTS toward category scores: actually scored this run and not excluded
+    by any hard gate (gambling/other DQ, rules_unreadable, or prohibited category). The
+    view-floor penalty is NOT an exclusion — it lives in the composite, so a view-floored
+    campaign still counts, just with its already-penalized (low) score."""
+    return (c.get("status") in ("scraped", "refreshed")
+            and not c.get("disqualified")
+            and not c.get("rules_unreadable")
+            and not c.get("excluded_prohibited"))
+
+
+def rank_categories(campaigns, agg=CATEGORY_AGG_DEFAULT, *, full_min=CATEGORY_FULL_MIN):
+    """Rank categories by an aggregate of their member campaigns' composites (highest first).
+
+    Each rankable campaign contributes to EVERY category in its `categories` multi-tag (a
+    sports-podcast lifts BOTH sports and podcast_talking). Excluded campaigns never count
+    (`_is_rankable`). `agg` picks the aggregation (top5|top3|top10|average|best); an unknown
+    value falls back to the default. Categories with < `full_min` members are flagged `thin`.
+    Returns [{category, score, count, thin, agg, top_campaigns[]}...], score-descending."""
+    if agg not in CATEGORY_AGG_MODES:
+        agg = CATEGORY_AGG_DEFAULT
+    buckets = {}
+    for c in campaigns:
+        if not _is_rankable(c):
+            continue
+        comp = c.get("composite_score") or 0
+        cats = c.get("categories") or [c.get("category") or "other"]
+        member = {"id": c.get("id"), "name": c.get("name"), "composite_score": comp}
+        for cat in cats:
+            buckets.setdefault(cat, []).append(member)
+    ranking = []
+    for cat, members in buckets.items():
+        members.sort(key=lambda m: m["composite_score"], reverse=True)
+        scores = [m["composite_score"] for m in members]
+        ranking.append({
+            "category": cat,
+            "score": _aggregate_category(scores, agg),
+            "count": len(members),
+            "thin": len(members) < full_min,
+            "agg": agg,
+            "top_campaigns": members[:5],
+        })
+    ranking.sort(key=lambda r: r["score"], reverse=True)
+    return ranking

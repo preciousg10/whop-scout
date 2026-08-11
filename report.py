@@ -16,10 +16,40 @@ def _composite_of(c):
     return c.get("composite_score") or 0
 
 
-def write_json(path, campaigns):
+def _cat_label(cat):
+    return _CATEGORY_LABELS.get(cat, (cat or "other").replace("_", " ").title())
+
+
+def _category_ranking_md(category_ranking):
+    """Markdown for the category-level ranking (highest first). Thin categories (fewer than
+    the full-min members) are flagged so a score resting on a small sample is obvious."""
+    lines = ["## Category ranking", ""]
+    if not category_ranking:
+        lines.extend(["(none — no rankable campaigns)", ""])
+        return lines
+    agg = category_ranking[0].get("agg", "top5")
+    lines.append(f"Each category scored as the **{agg}** of its member campaigns' composites "
+                 "(a campaign counts toward every category it fits; excluded campaigns don't "
+                 "count). **THIN** = fewer than 5 campaigns, so the score rests on a small "
+                 "sample.")
+    lines.append("")
+    for i, r in enumerate(category_ranking, 1):
+        thin = " **[THIN]**" if r.get("thin") else ""
+        top = ", ".join(m.get("name") or "(unnamed)" for m in (r.get("top_campaigns") or [])[:3])
+        lines.append(f"{i}. **{_cat_label(r.get('category'))}** — score {r.get('score'):.4f} "
+                     f"· {r.get('count')} campaign(s){thin}"
+                     + (f" · top: {top}" if top else ""))
+    lines.append("")
+    return lines
+
+
+def write_json(path, campaigns, category_ranking=None):
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "count": len(campaigns),
+        # Category-level ranking (highest first) on top of per-campaign scoring. None until
+        # computed; [] when there's nothing rankable. Per-campaign records stay in "campaigns".
+        "category_ranking": category_ranking,
         "campaigns": campaigns,
     }
     with open(path, "w", encoding="utf-8") as f:
@@ -267,7 +297,7 @@ def _coverage_md(active):
     return out
 
 
-def write_summary_md(path, campaigns):
+def write_summary_md(path, campaigns, category_ranking=None):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
     # rules_unreadable campaigns (rules only in an unreadable Notion source) are EXCLUDED from
     # the ranked/active set — the clipper must never receive a campaign whose banned-words are
@@ -305,6 +335,9 @@ def write_summary_md(path, campaigns):
     # Data-coverage report — how much real signal underpins this ranking, up top so a
     # low-coverage rank is obvious at a glance (never something to dig for).
     lines.extend(_coverage_md(active))
+
+    # Category-level ranking (highest first) — sits above the per-campaign list.
+    lines.extend(_category_ranking_md(category_ranking))
 
     lines.append("## Ranked campaigns")
     lines.append("")
@@ -401,7 +434,7 @@ def write_summary_md(path, campaigns):
         f.write("\n".join(lines))
 
 
-def terminal_report(campaigns, *, db_total, new_count, failures):
+def terminal_report(campaigns, *, db_total, new_count, failures, category_ranking=None):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
     prohibited = [c for c in scored if c.get("excluded_prohibited")]
     unreadable = [c for c in scored if c.get("rules_unreadable")
@@ -469,4 +502,12 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
         cat = (c.get("category") or "other")[:10]
         print(f"    {i:>2}. {_composite_of(c):7.3f}  {name:<26}  {earn_txt:>6}  "
               f"{rep:>5}  {data:>4}  {cat}")
+    if category_ranking:
+        agg = category_ranking[0].get("agg", "top5")
+        print("")
+        print(f"  Category ranking ({agg} of members' composites; THIN = <5 campaigns):")
+        for i, r in enumerate(category_ranking, 1):
+            thin = " [THIN]" if r.get("thin") else ""
+            print(f"    {i:>2}. {r.get('score'):7.3f}  {_cat_label(r.get('category')):<16}  "
+                  f"{r.get('count')} campaign(s){thin}")
     print("=" * 72)

@@ -97,6 +97,9 @@ class Config:
     # scoring / footage
     footage_top_n: int = 30                   # probe this many top campaigns
     social_top_n: int = 30                    # source-popularity lookup on this many
+    # category-level ranking (on top of per-campaign scoring). A category's score aggregates
+    # its member campaigns' composites; how = this knob: top5 | top3 | top10 | average | best.
+    category_agg: str = "top5"
 
     # proven-clips / repeatable-clippability (the heavy new ranking lever).
     # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
@@ -614,7 +617,8 @@ _ANALYSIS_DEFAULTS = {
     "min_view_threshold": None,   # views a video must reach before ANY payout (distinct gate)
     "max_payout_per_video": None, "max_payout_uncapped": False,
     "participants_per_1k_budget": None,
-    "category": None,
+    "category": None,          # single best category (per-campaign display / style_fit)
+    "categories": [],          # ALL categories it fits (multi-tag, for category ranking)
     "join_cta": None, "open_to_all": "unclear",
     "disqualifiers": [], "disqualified": False,
     "first_seen_at": None, "days_active": None, "payout_velocity": None,
@@ -794,6 +798,7 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     # category + open-to-instant-join classification + hard disqualifiers. Openness reads
     # the brief plus the page CTA (Apply vs Join); an application/selection gate is a hard DQ.
     rec["category"] = extract.classify_category(rec.get("name"), rules, rec.get("platforms"))
+    rec["categories"] = extract.classify_categories(rec.get("name"), rules, rec.get("platforms"))
     rec["open_to_all"] = extract.classify_openness(rules, rec.get("join_cta"))
     rec["disqualifiers"] = extract.detect_disqualifiers(
         rules, rec.get("platforms"), rec.get("source_links"), rec.get("join_cta"))
@@ -2049,8 +2054,11 @@ def main():
         seen_ids = [c["id"] for c in cards if c.get("id")]
         all_records = assemble(results, skipped, prev_by_id, seen_ids, completed_ids)
 
-        report.write_json(cfg.campaigns_path, all_records)
-        report.write_summary_md(cfg.summary_path, all_records)
+        # Category-level ranking on top of per-campaign scoring (per-campaign ranking stays).
+        category_ranking = scoring.rank_categories(all_records, cfg.category_agg)
+
+        report.write_json(cfg.campaigns_path, all_records, category_ranking=category_ranking)
+        report.write_summary_md(cfg.summary_path, all_records, category_ranking=category_ranking)
         state.finish_run()
 
         report.terminal_report(
@@ -2058,6 +2066,7 @@ def main():
             db_total=state.known_count,
             new_count=len(new_ids),
             failures=_count_errors(cfg.errors_path) - errors_before,
+            category_ranking=category_ranking,
         )
         if stopped_reason:
             print(f"\n(Run ended early: {stopped_reason})")

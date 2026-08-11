@@ -572,17 +572,34 @@ _CATEGORY_KEYWORDS = {
 }
 
 
-def classify_category(name, text, platforms=None):
-    """Tag a campaign: streamer_irl / gaming / sports / podcast_talking / brand_product /
-    music / meme / other. Keyword-scored; ties break by the order above. 'other' when
-    nothing matches (honest, not a guess)."""
+def _category_scores(name, text, platforms=None):
+    """Raw keyword hit-count per category (+ the twitch/kick streamer boost). Shared by the
+    single-best `classify_category` and the multi-tag `classify_categories`."""
     hay = f" {name or ''} {text or ''} ".lower()
     scores = {cat: sum(hay.count(k) for k in kws) for cat, kws in _CATEGORY_KEYWORDS.items()}
-    plats = set(platforms or [])
-    if plats & {"twitch", "kick"}:
+    if set(platforms or []) & {"twitch", "kick"}:
         scores["streamer_irl"] += 2
+    return scores
+
+
+def classify_category(name, text, platforms=None):
+    """Tag a campaign with its single BEST category: streamer_irl / gaming / sports /
+    podcast_talking / brand_product / music / meme / other. Keyword-scored; ties break by the
+    order above. 'other' when nothing matches (honest, not a guess)."""
+    scores = _category_scores(name, text, platforms)
     best = max(scores, key=lambda c: scores[c])
     return best if scores[best] > 0 else "other"
+
+
+def classify_categories(name, text, platforms=None):
+    """ALL categories a campaign fits (multi-tag), for category-level ranking — a sports-podcast
+    counts toward BOTH sports and podcast_talking. Every category with a keyword hit, ordered by
+    hit-count (then the canonical order). `['other']` when nothing matches — never empty."""
+    scores = _category_scores(name, text, platforms)
+    order = list(_CATEGORY_KEYWORDS)
+    hits = [c for c in order if scores[c] > 0]
+    hits.sort(key=lambda c: (-scores[c], order.index(c)))
+    return hits or ["other"]
 
 
 # --- source handles ------------------------------------------------------------
