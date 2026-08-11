@@ -238,6 +238,45 @@ def parse_min_view_threshold(text):
     return max(found) if found else None
 
 
+# --- resource-doc reference (capture cross-check) ------------------------------
+# Does the modal TEXT indicate a linked Doc / Drive / Notion / resource FOLDER exists? Used
+# ONLY to cross-check capture: when this is true but resource_links came back empty, a doc was
+# silently missed (surfaced as capture_suspect, never a change to capture itself). Detection is
+# deliberately SPECIFIC — host names, service names, "... folder", "the doc", "swipe file",
+# "linked below" — so ordinary words ("brief overview", "requirements:", "document your clips")
+# don't false-fire. Mirrors scout._RESOURCE_HOST_RE's host set.
+_RESOURCE_REF_PATTERNS = (
+    # explicit resource-host names in the text (a bare / uncaught URL or a spelled-out host)
+    r"docs\.google|drive\.google|sheets\.google|slides\.google|notion\.so|notion\.site|"
+    r"dropbox\.com|onedrive|1drv\.ms|mega\.nz",
+    # service names spelled out
+    r"google\s+(?:doc|docs|drive|sheet|sheets|slide|slides)\b|\bnotion\b|\bdropbox\b",
+    # a storage / asset FOLDER
+    r"\b(?:drive|content|footage|clip|clips|asset|assets|media|raw|b-?roll)\s+folder\b|"
+    r"\bfolder\s+(?:link|below|here)\b|\bfolder\s+of\s+(?:clips|footage|videos)\b",
+    # a referenced DOC / sheet with a determiner or qualifier (not the bare word)
+    r"\b(?:the|our|this|full|creative|attached|linked|pinned)\s+(?:doc|document|sheet|brief)\b|"
+    r"\b(?:rules?|guidelines?|requirements?|content|resource|brief|style)\s+"
+    r"(?:doc|document|sheet)\b|\bswipe\s+file\b",
+    # explicit "linked / attached / pinned ..." pointing at a resource
+    r"\b(?:linked|attached|pinned)\s+(?:below|here|above)\b|"
+    r"\b(?:found|available|linked|attached)\s+in\s+the\s+(?:doc|drive|folder|notion)\b",
+)
+_RESOURCE_REF_RE = re.compile("(" + "|".join(_RESOURCE_REF_PATTERNS) + ")", re.I)
+
+
+def references_resource_doc(text):
+    """The matched phrase if `text` indicates a linked Doc/Drive/Notion/resource folder
+    EXISTS, else None. Deliberately specific so ordinary words don't false-fire — used to
+    detect that resource_links capture may have silently missed a doc."""
+    if not text:
+        return None
+    m = _RESOURCE_REF_RE.search(text)
+    if not m:
+        return None
+    return " ".join(m.group(1).split())[:60]
+
+
 # --- max payout per video ------------------------------------------------------
 _MAX_UNCAPPED_RE = re.compile(
     r"\b(no\s+max(?:imum)?|no\s+cap|uncapped|unlimited\s+(?:earnings|payout|payouts)|"

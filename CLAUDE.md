@@ -48,7 +48,7 @@ python proven_clips.py "MrBeast" https://youtube.com/@MrBeast
 There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 (`parse_pay`, `parse_money`, `parse_remaining_fraction`, `parse_platforms`,
 `parse_int`, `campaign_id_from_url`, `parse_min_payout`, `min_views_to_payout`,
-`parse_min_view_threshold`, `extract_handles`, `parse_max_payout`,
+`parse_min_view_threshold`, `references_resource_doc`, `extract_handles`, `parse_max_payout`,
 `participants_per_1k_budget`, `payout_velocity`,
 `detect_disqualifiers`, `classify_openness`, `classify_category`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
@@ -199,10 +199,16 @@ viability, `max_payout_per_video`/`uncapped`, `participants_per_1k_budget`, `cat
 (`extract.classify_category`), `open_to_all` (`extract.classify_openness` — yes/no/unclear),
 `disqualifiers` (`extract.detect_disqualifiers` — gambling/face-or-voice/min-followers/geo/
 non-clippable-format/paid-ad-spend/non-English/gated-footage/**application-gated**),
-`first_seen_at`+`days_active`+`payout_velocity`, and the per-run `snapshot` + cross-run
-`trends` (`scoring.compute_trends` vs `prev_rec.snapshot`: accelerating/steady/stalling/dead,
-off budget-paid + participant deltas). It reads only already-scraped fields, so it's
-pure/cheap and idempotent.
+`first_seen_at`+`days_active`+`payout_velocity`, `min_view_threshold`
+(`extract.parse_min_view_threshold`), the `style_fit` inputs, and the per-run `snapshot` +
+cross-run `trends` (`scoring.compute_trends` vs `prev_rec.snapshot`: accelerating/steady/
+stalling/dead, off budget-paid + participant deltas). It also runs the **resource-capture
+cross-check**: when the modal text references a linked Doc/Drive/Notion/folder
+(`extract.references_resource_doc`) but `resource_links` came back EMPTY, it sets
+`capture_suspect`=True (+`capture_suspect_reason`, the matched phrase) so a silently-missed doc
+surfaces as a `CAPTURE-SUSPECT` report warning instead of passing as "no docs" — DETECTION
+ONLY, it never touches capture logic. It reads only already-scraped fields, so it's pure/cheap
+and idempotent.
 
 **Application/selection gate (`open_to_all` + the `application_gated` disqualifier).** A
 campaign that isn't an instant open join — you must apply, be accepted/approved, get invited,

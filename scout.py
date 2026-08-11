@@ -639,6 +639,11 @@ _ANALYSIS_DEFAULTS = {
     # labelled), and the on-modal stats. The clipper reads rules from BOTH the on-modal text
     # AND the linked docs, whichever a campaign uses.
     "modal_requirements_text": None, "resource_links": [], "modal_stats": None,
+    # resource-capture reliability cross-check: the modal TEXT references a linked
+    # Doc/Drive/Notion/folder but resource_links came back EMPTY (a silently-missed doc). This
+    # is DETECTION only — capture logic is unchanged — surfaced as a report warning so a missed
+    # doc never passes as "no docs". See enrich_active + extract.references_resource_doc.
+    "capture_suspect": False, "capture_suspect_reason": None,
     # Rules readability (Notion handling). rules_source: modal/gdoc/notion/unreadable/none;
     # rules_unreadable=True (rules ONLY in a source we can't read) EXCLUDES the campaign from
     # the ranked output the clipper reads. notion_rules_text holds a successfully-fetched
@@ -764,6 +769,18 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     # the threshold. Reads the on-modal requirements text as well as the rules bullets.
     mv_text = " ".join(t for t in (rules, rec.get("modal_requirements_text")) if t)
     rec["min_view_threshold"] = extract.parse_min_view_threshold(mv_text)
+
+    # resource-capture reliability: if the modal TEXT references a linked Doc/Drive/Notion/
+    # folder but resource_links came back EMPTY, a doc was silently missed. Flag it (DETECTION
+    # only — capture logic unchanged) so it surfaces in the report instead of passing as "no
+    # docs". When links WERE captured, the reference is expected — not suspect.
+    if rec.get("resource_links"):
+        rec["capture_suspect"] = False
+        rec["capture_suspect_reason"] = None
+    else:
+        ref = extract.references_resource_doc(mv_text)
+        rec["capture_suspect"] = bool(ref)
+        rec["capture_suspect_reason"] = ref or None
 
     # max payout per video
     mp = extract.parse_max_payout(rules)

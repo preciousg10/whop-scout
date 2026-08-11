@@ -71,6 +71,10 @@ def _warning_flags(c):
     mvt = c.get("min_view_threshold")
     if mvt:
         flags.append(f"MIN-VIEW-THRESHOLD (needs {mvt:,} views before ANY payout)")
+    if c.get("capture_suspect"):
+        reason = c.get("capture_suspect_reason") or "doc/resource"
+        flags.append(f"CAPTURE-SUSPECT (modal references '{reason}' but no resource link "
+                     f"captured — a doc may have been missed)")
     ct = c.get("content_type") or {}
     if ct.get("type") and ct.get("standard") is False:
         flags.append(f"non-standard footage ({ct['type']})")
@@ -413,6 +417,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
                 reverse=True)
     high_min = sum(1 for c in active if c.get("high_minimum"))
     min_view_gated = sum(1 for c in active if c.get("min_view_threshold"))
+    capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
 
@@ -431,6 +436,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
     print(f"  Clipper-done (DONE list, excluded)   : {completed}")
     print(f"  Flagged HIGH_MINIMUM                 : {high_min}")
     print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
+    print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")
     print("")
