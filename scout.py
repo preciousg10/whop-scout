@@ -774,6 +774,16 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
         rules, rec.get("platforms"), rec.get("source_links"), rec.get("join_cta"))
     rec["disqualified"] = bool(rec["disqualifiers"])
 
+    # prohibited/vice category exclusion — a SEPARATE, stronger gate than the gambling
+    # disqualifier above (which only sinks to composite 0): like rules_unreadable it removes
+    # the campaign from the ranked output entirely. Reads name + category + on-modal
+    # requirements text (extract.PROHIBITED_* are the extensible keyword/brand lists).
+    prohibited = extract.detect_prohibited_category(
+        rec.get("name"), rec.get("category"), rec.get("modal_requirements_text"))
+    rec["excluded_prohibited"] = bool(prohibited)
+    rec["excluded_prohibited_reason"] = prohibited["reason"] if prohibited else None
+    rec["excluded_prohibited_borderline"] = bool(prohibited and prohibited["borderline"])
+
     # campaign age (first_seen carried across runs) + payout velocity
     first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \
         or now.isoformat()

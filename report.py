@@ -258,10 +258,16 @@ def write_summary_md(path, campaigns):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
     # rules_unreadable campaigns (rules only in an unreadable Notion source) are EXCLUDED from
     # the ranked/active set — the clipper must never receive a campaign whose banned-words are
-    # unknown — but kept and shown in their own section with the reason.
-    unreadable = [c for c in scored if c.get("rules_unreadable") and not c.get("disqualified")]
-    active = [c for c in scored if not c.get("disqualified") and not c.get("rules_unreadable")]
-    disqualified = [c for c in scored if c.get("disqualified")]
+    # unknown — but kept and shown in their own section with the reason. Prohibited/vice
+    # campaigns (gambling/betting/alcohol/vape/…) are EXCLUDED the same way — never handed to
+    # the clipper — and take precedence over the other buckets so they show once, with reason.
+    prohibited = [c for c in scored if c.get("excluded_prohibited")]
+    unreadable = [c for c in scored if c.get("rules_unreadable")
+                  and not c.get("disqualified") and not c.get("excluded_prohibited")]
+    active = [c for c in scored if not c.get("disqualified")
+              and not c.get("rules_unreadable") and not c.get("excluded_prohibited")]
+    disqualified = [c for c in scored if c.get("disqualified")
+                    and not c.get("excluded_prohibited")]
     # Rank by composite; ties break toward the better-UNDERSTOOD campaign (more core
     # signals known), then the crude pre_score.
     active.sort(key=lambda c: (_composite_of(c), _core_known(c), c.get("pre_score", 0)),
@@ -273,8 +279,8 @@ def write_summary_md(path, campaigns):
              f"Generated {datetime.now(timezone.utc).isoformat()}", ""]
     lines.append(
         f"{len(active)} rankable · {len(disqualified)} disqualified · "
-        f"{len(unreadable)} rules-unreadable · {len(skipped)} pre-filtered · "
-        f"{len(completed)} clipper-done.")
+        f"{len(prohibited)} prohibited · {len(unreadable)} rules-unreadable · "
+        f"{len(skipped)} pre-filtered · {len(completed)} clipper-done.")
     lines.append("")
     lines.append("Sorted by composite rank (reach x rate drives it; expected $/clip and "
                  "proven clippability are the heavy levers). Campaigns ranking mostly on "
@@ -336,6 +342,26 @@ def write_summary_md(path, campaigns):
             lines.append(f"- {name} — {c.get('rules_unreadable_reason') or 'rules unreadable'}")
         lines.append("")
 
+    # --- excluded: prohibited category ------------------------------------------
+    if prohibited:
+        # clear DQs first, borderline (ambiguous-keyword-only) last, then by name.
+        prohibited.sort(key=lambda c: (bool(c.get("excluded_prohibited_borderline")),
+                                       c.get("name") or ""))
+        n_border = sum(1 for c in prohibited if c.get("excluded_prohibited_borderline"))
+        lines.append("## Excluded — prohibited category (NOT ranked, NOT handed to the clipper)")
+        lines.append("")
+        lines.append(f"{len(prohibited)} auto-excluded ({n_border} borderline). Betting/gambling/"
+                     "casino/sportsbook, alcohol/drinking, vape and similar vice categories are "
+                     "held out of the ranking. **BORDERLINE** rows matched only an ambiguous "
+                     "keyword (bet/stake/odds/drink…) — review them for a false positive.")
+        lines.append("")
+        for c in prohibited:
+            name = c.get("name") or "(unnamed)"
+            tag = " **[BORDERLINE — review]**" if c.get("excluded_prohibited_borderline") else ""
+            reason = c.get("excluded_prohibited_reason") or "prohibited category"
+            lines.append(f"- {name} — {reason}{tag}")
+        lines.append("")
+
     # --- skipped by pre-filter --------------------------------------------------
     if skipped:
         lines.append("## Skipped by pre-filter")
@@ -364,9 +390,13 @@ def write_summary_md(path, campaigns):
 
 def terminal_report(campaigns, *, db_total, new_count, failures):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
-    unreadable = [c for c in scored if c.get("rules_unreadable") and not c.get("disqualified")]
-    active = [c for c in scored if not c.get("disqualified") and not c.get("rules_unreadable")]
-    disqualified = [c for c in scored if c.get("disqualified")]
+    prohibited = [c for c in scored if c.get("excluded_prohibited")]
+    unreadable = [c for c in scored if c.get("rules_unreadable")
+                  and not c.get("disqualified") and not c.get("excluded_prohibited")]
+    active = [c for c in scored if not c.get("disqualified")
+              and not c.get("rules_unreadable") and not c.get("excluded_prohibited")]
+    disqualified = [c for c in scored if c.get("disqualified")
+                    and not c.get("excluded_prohibited")]
     newly_scraped = sum(1 for c in scored if c.get("status") == "scraped")
     refreshed = sum(1 for c in scored if c.get("status") == "refreshed")
     completed = sum(1 for c in campaigns if c.get("status") == "completed")
@@ -383,6 +413,8 @@ def terminal_report(campaigns, *, db_total, new_count, failures):
     print(f"  Rankable campaigns this run          : {len(active)}")
     print(f"  Disqualified (sunk, still shown)     : {len(disqualified)}")
     print(f"  Excluded — rules unreadable (Notion) : {len(unreadable)}")
+    n_border = sum(1 for c in prohibited if c.get("excluded_prohibited_borderline"))
+    print(f"  Excluded — prohibited category       : {len(prohibited)} ({n_border} borderline)")
     print(f"  Total campaigns in DB                : {db_total}")
     print(f"  Scraped this run (unreached)         : {newly_scraped} ({new_count} never-seen)")
     print(f"  Known, refreshed no re-scrape        : {refreshed}")
