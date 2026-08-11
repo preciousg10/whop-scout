@@ -8,6 +8,7 @@ campaigns_summary.md
 campaign_template.json
 proven_clips_result.json
 proven_clips_cache.json
+category_cache.json
 state.json
 errors.log
 probe_*.png

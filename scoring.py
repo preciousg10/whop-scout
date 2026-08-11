@@ -114,6 +114,8 @@ STYLE_FIT_CATEGORY = {
     "meme":            0.9,   # funny / viral / shitpost
     "sports":          0.85,  # action moments
     "podcast_talking": 0.5,   # talking-head — clippable but not chaotic (neutral)
+    "news":            0.45,  # commentary / current-events talk
+    "movie_tv":        0.5,   # films / trailers / cinematic — variable
     "music":           0.25,  # polished / produced
     "brand_product":   0.15,  # jewelry, corporate, product promos — produced
     "other":           0.5,   # unknown category — neutral, never a guessed penalty
@@ -912,11 +914,11 @@ def _is_rankable(c):
 def rank_categories(campaigns, agg=CATEGORY_AGG_DEFAULT, *, full_min=CATEGORY_FULL_MIN):
     """Rank categories by an aggregate of their member campaigns' composites (highest first).
 
-    Each rankable campaign contributes to EVERY category in its `categories` multi-tag (a
-    sports-podcast lifts BOTH sports and podcast_talking). Excluded campaigns never count
-    (`_is_rankable`). `agg` picks the aggregation (top5|top3|top10|average|best); an unknown
-    value falls back to the default. Categories with < `full_min` members are flagged `thin`.
-    Returns [{category, score, count, thin, agg, top_campaigns[]}...], score-descending."""
+    Each rankable campaign counts toward exactly ONE category — its PRIMARY (`category`) — so
+    secondary tags never inflate the counts. Excluded campaigns never count (`_is_rankable`).
+    `agg` picks the aggregation (top5|top3|top10|average|best); an unknown value falls back to
+    the default. Categories with < `full_min` members are flagged `thin`. Returns
+    [{category, score, count, thin, agg, top_campaigns[]}...], score-descending."""
     if agg not in CATEGORY_AGG_MODES:
         agg = CATEGORY_AGG_DEFAULT
     buckets = {}
@@ -924,10 +926,11 @@ def rank_categories(campaigns, agg=CATEGORY_AGG_DEFAULT, *, full_min=CATEGORY_FU
         if not _is_rankable(c):
             continue
         comp = c.get("composite_score") or 0
-        cats = c.get("categories") or [c.get("category") or "other"]
+        # PRIMARY category only (guard #6): a campaign counts toward exactly ONE category so
+        # secondaries can't inflate counts. `categories`[0] == the primary; fall back cleanly.
+        cat = c.get("category") or (c.get("categories") or ["other"])[0] or "other"
         member = {"id": c.get("id"), "name": c.get("name"), "composite_score": comp}
-        for cat in cats:
-            buckets.setdefault(cat, []).append(member)
+        buckets.setdefault(cat, []).append(member)
     ranking = []
     for cat, members in buckets.items():
         members.sort(key=lambda m: m["composite_score"], reverse=True)

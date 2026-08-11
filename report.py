@@ -7,7 +7,8 @@ import scoring
 _CATEGORY_LABELS = {
     "streamer_irl": "Streamer/IRL", "gaming": "Gaming", "sports": "Sports",
     "podcast_talking": "Podcast/Talking", "brand_product": "Brand/Product",
-    "music": "Music", "meme": "Meme", "other": "Other",
+    "music": "Music", "meme": "Meme", "news": "News", "movie_tv": "Movie/TV",
+    "other": "Other",
 }
 _CATEGORY_ORDER = list(_CATEGORY_LABELS.keys())
 
@@ -18,6 +19,30 @@ def _composite_of(c):
 
 def _cat_label(cat):
     return _CATEGORY_LABELS.get(cat, (cat or "other").replace("_", " ").title())
+
+
+def _category_breakdown_md(cs):
+    """Markdown for the Groq recategorization breakdown: count per category, low-confidence
+    total, and how far 'other' shrank vs the legacy keyword tagger."""
+    if not cs:
+        return []
+    lines = ["## Categorization (Groq)", ""]
+    srcs = cs.get("sources") or {}
+    lines.append(f"{cs.get('total', 0)} campaigns categorized "
+                 f"(groq {srcs.get('groq', 0)} · cache {srcs.get('cache', 0)} · "
+                 f"keyword-fallback {srcs.get('keyword_fallback', 0)}). "
+                 f"{cs.get('low_confidence', 0)} low-confidence.")
+    now_other = cs.get("other_now", 0)
+    base = cs.get("other_keyword_baseline")
+    if base is not None:
+        delta = base - now_other
+        lines.append(f"**\"Other\" is now {now_other}** (keyword tagger would put {base} here "
+                     f"on this set — a {delta:+d} change).")
+    lines.append("")
+    for cat, n in (cs.get("by_category") or {}).items():
+        lines.append(f"- {_cat_label(cat)}: {n}")
+    lines.append("")
+    return lines
 
 
 def _category_ranking_md(category_ranking):
@@ -43,10 +68,12 @@ def _category_ranking_md(category_ranking):
     return lines
 
 
-def write_json(path, campaigns, category_ranking=None):
+def write_json(path, campaigns, category_ranking=None, category_summary=None):
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "count": len(campaigns),
+        # Groq categorization breakdown (counts per category, low-confidence, 'other' shrink).
+        "category_summary": category_summary,
         # Category-level ranking (highest first) on top of per-campaign scoring. None until
         # computed; [] when there's nothing rankable. Per-campaign records stay in "campaigns".
         "category_ranking": category_ranking,
@@ -297,7 +324,7 @@ def _coverage_md(active):
     return out
 
 
-def write_summary_md(path, campaigns, category_ranking=None):
+def write_summary_md(path, campaigns, category_ranking=None, category_summary=None):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
     # rules_unreadable campaigns (rules only in an unreadable Notion source) are EXCLUDED from
     # the ranked/active set — the clipper must never receive a campaign whose banned-words are
@@ -336,7 +363,9 @@ def write_summary_md(path, campaigns, category_ranking=None):
     # low-coverage rank is obvious at a glance (never something to dig for).
     lines.extend(_coverage_md(active))
 
-    # Category-level ranking (highest first) — sits above the per-campaign list.
+    # Groq categorization breakdown, then the category-level ranking (highest first) — both
+    # sit above the per-campaign list.
+    lines.extend(_category_breakdown_md(category_summary))
     lines.extend(_category_ranking_md(category_ranking))
 
     lines.append("## Ranked campaigns")
@@ -434,7 +463,8 @@ def write_summary_md(path, campaigns, category_ranking=None):
         f.write("\n".join(lines))
 
 
-def terminal_report(campaigns, *, db_total, new_count, failures, category_ranking=None):
+def terminal_report(campaigns, *, db_total, new_count, failures, category_ranking=None,
+                    category_summary=None):
     scored = [c for c in campaigns if c.get("status") in ("scraped", "refreshed")]
     prohibited = [c for c in scored if c.get("excluded_prohibited")]
     unreadable = [c for c in scored if c.get("rules_unreadable")
@@ -502,6 +532,16 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
         cat = (c.get("category") or "other")[:10]
         print(f"    {i:>2}. {_composite_of(c):7.3f}  {name:<26}  {earn_txt:>6}  "
               f"{rep:>5}  {data:>4}  {cat}")
+    if category_summary:
+        cs = category_summary
+        srcs = cs.get("sources") or {}
+        base = cs.get("other_keyword_baseline")
+        base_txt = (f" (keyword baseline {base})" if base is not None else "")
+        print("")
+        print(f"  Categorization (Groq): {cs.get('total', 0)} campaigns · "
+              f"groq {srcs.get('groq', 0)}/cache {srcs.get('cache', 0)}/"
+              f"kw {srcs.get('keyword_fallback', 0)} · {cs.get('low_confidence', 0)} low-conf · "
+              f"'other'={cs.get('other_now', 0)}{base_txt}")
     if category_ranking:
         agg = category_ranking[0].get("agg", "top5")
         print("")

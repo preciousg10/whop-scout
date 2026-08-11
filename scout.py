@@ -32,6 +32,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 import extract
 import footage as footage_mod
+import categorize as categorize_mod
 import intake as intake_mod
 import proven_clips as clips_mod
 import report
@@ -100,6 +101,11 @@ class Config:
     # category-level ranking (on top of per-campaign scoring). A category's score aggregates
     # its member campaigns' composites; how = this knob: top5 | top3 | top10 | average | best.
     category_agg: str = "top5"
+    # Groq-based categorizer (categorize.py): reads name + modal text + footage TITLES +
+    # creator and assigns a primary category from the fixed set. Batched + content-hash cached.
+    category_cache_path: str = "category_cache.json"  # per-content cache (skip Groq if unchanged)
+    category_batch_size: int = 20             # campaigns per Groq call (free-tier friendly)
+    category_model: str = None                # None -> $GROQ_MODEL or llama-3.3-70b-versatile
 
     # proven-clips / repeatable-clippability (the heavy new ranking lever).
     # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
@@ -1938,6 +1944,9 @@ def main():
     parser = argparse.ArgumentParser(description="Scout — personal Whop Content Rewards scraper.")
     parser.add_argument("--force", action="store_true", help="ignore the 20h once-daily guard")
     parser.add_argument("--refresh", action="store_true", help="full re-scrape of every campaign")
+    parser.add_argument("--recategorize", action="store_true",
+                        help="clear the category cache and re-run the Groq categorizer on every "
+                             "campaign (default reuses cached categories for unchanged content)")
     parser.add_argument("--probe", action="store_true", help="confirm selectors: screenshot + dump DOM")
     parser.add_argument("--test-capture", nargs="?", type=int, const=5, default=None, metavar="N",
                         help="THROWAWAY diagnostic: scrape only the first N campaigns (default 5) "
@@ -2002,6 +2011,7 @@ def main():
 
         stopped_reason = None
         results, new_ids, skipped = [], [], []
+        cat_summary = None
         cards = []
         completed_ids = load_completed(cfg.completed_path)
         if completed_ids:
@@ -2046,6 +2056,12 @@ def main():
             # is unlimited, so analyze EVERY non-disqualified campaign (not a top-N):
             # this is a top-two ranking lever and coverage matters more than speed.
             clips_mod.probe_campaigns(results, cfg, pacer)
+            # Groq-based categorization — runs AFTER intake so footage TITLES are available.
+            # Overwrites the cheap keyword baseline from enrich_active with the model's
+            # primary/secondary/confidence. Batched + content-hash cached; degrades to keyword
+            # when Groq is unavailable. Ranking (assemble) then buckets by the primary category.
+            cat_summary = categorize_mod.categorize_campaigns(
+                results, cfg, recategorize=args.recategorize)
         except StopRun as e:
             stopped_reason = str(e)
             print(f"\n!! STOP: {e}. Saving progress and exiting. Not today — browse manually.")
@@ -2057,8 +2073,10 @@ def main():
         # Category-level ranking on top of per-campaign scoring (per-campaign ranking stays).
         category_ranking = scoring.rank_categories(all_records, cfg.category_agg)
 
-        report.write_json(cfg.campaigns_path, all_records, category_ranking=category_ranking)
-        report.write_summary_md(cfg.summary_path, all_records, category_ranking=category_ranking)
+        report.write_json(cfg.campaigns_path, all_records, category_ranking=category_ranking,
+                          category_summary=cat_summary)
+        report.write_summary_md(cfg.summary_path, all_records, category_ranking=category_ranking,
+                                category_summary=cat_summary)
         state.finish_run()
 
         report.terminal_report(
@@ -2067,6 +2085,7 @@ def main():
             new_count=len(new_ids),
             failures=_count_errors(cfg.errors_path) - errors_before,
             category_ranking=category_ranking,
+            category_summary=cat_summary,
         )
         if stopped_reason:
             print(f"\n(Run ended early: {stopped_reason})")

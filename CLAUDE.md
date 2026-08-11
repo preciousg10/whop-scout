@@ -27,6 +27,7 @@ python scout.py
 # flags
 python scout.py --force     # ignore the 20h once-daily guard
 python scout.py --refresh   # full re-scrape of every campaign (default is delta)
+python scout.py --recategorize  # clear the category cache + re-run the Groq categorizer
 
 # DONE list — mark campaign(s) the CLIPPER has exhausted (excluded from scraping AND
 # ranking; "already scraped" is NOT done). Pure file edit, no browser; writes
@@ -59,8 +60,11 @@ Playwright dependency — test them by importing `extract` directly, no browser 
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
 `action_density_factor`, `footage_access_factor`, `style_fit`, `rank_categories`,
 `project_budget_drain`,
-`participant_growth`, `source_saturation_estimate`, `account_reusability`, and their
-`*_factor` companions) and `social.parse_count` are likewise pure. `strategic.py`
+`participant_growth`, `source_saturation_estimate`, `account_reusability`, `rank_categories`,
+and their `*_factor` companions) and `social.parse_count` are likewise pure. `categorize.py`'s
+signal/hash/prompt/parse/validate layer (`campaign_signals`, `content_hash`, `build_batch_prompt`,
+`parse_batch_response`, `validate_result`, `keyword_result`) is testable with no Groq/network.
+`strategic.py`
 (`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
 `classify_content_type`, `analyze_transcript_density`, `aggregate_access`,
 `footage_volume`) — test the substance logic with no network. So is the analysis layer of `proven_clips.py` (`clip_performance`,
@@ -70,7 +74,9 @@ yt-dlp/network needed to test the legitimacy/consistency/template math.
 
 ## Architecture
 
-Runtime is fully standalone (`python scout.py`), no Claude/LLM involvement. Flat
+Runtime is standalone (`python scout.py`). The ONE model touchpoint is campaign
+categorization (`categorize.py`, Groq — see below), which degrades to the keyword tagger when
+Groq is unavailable so a run never depends on it; nothing else calls an LLM. Flat
 module layout; `scout.py` imports the others and none import back into it (no
 circular deps). Data flows in one direction:
 
@@ -85,8 +91,11 @@ circular deps). Data flows in one direction:
   disqualifier, so an undownloadable campaign is sunk before further effort)
 → `scoring.pre_score` → `social.probe_sources` + `footage.probe_campaigns` +
 `proven_clips.probe_campaigns` (ALL non-disqualified campaigns)
+→ `categorize.categorize_campaigns` (Groq primary/secondary/confidence — runs after intake so
+footage titles exist; batched + content-hash cached; degrades to keyword)
 → `assemble` merges + carries forward, then `strategic.compute_strategic_signals` fills
-the cross-run/strategic signals over the FULL list, then `composite_score` → `report.*`.
+the cross-run/strategic signals over the FULL list, then `composite_score` +
+`rank_categories` (category ranking by primary category) → `report.*`.
 
 **Cross-run + strategic signals (`strategic.py`, built on run history — NO new scraping).**
 `enrich_active` accumulates a per-run `snapshot_history` (capped) alongside each `snapshot`;
@@ -195,18 +204,37 @@ sinks but is shown in the report's DISQUALIFIED section with reasons. On top of 
 drain, participant growth, source saturation, recurring creator, account reusability, and the
 neutral `performance_factor` stub) — see the "Cross-run + strategic signals" note above.
 
+**Categorization (`categorize.py`, Groq).** Replaces the weak name-only keyword tagger (which
+dumped ~182 campaigns into "other", missing obvious ones like "Jesser x ClipFarm"=sports). A
+Groq model reads whatever signal each campaign exposes — name (always), `modal_requirements_text`
+(when present, truncated), footage/resource TITLES (the strings intake already captured, first
+few, **titles as TEXT — never downloading video**), and creator (tiebreaker) — and returns a
+`primary_category` from a FIXED set (`categorize.CATEGORIES`: sports/streamer_irl/podcast_talking/
+gaming/music/brand_product/meme/news/movie_tv/other), optional `secondary_categories`, and a
+`category_confidence` (high/low). Guards: the model may ONLY pick from the fixed list (anything
+else → "other"); insufficient/conflicting signals → "other"/low, never a guessed label; calls are
+BATCHED (`cfg.category_batch_size`, default 20) to respect Groq free-tier limits; results are
+CACHED keyed to a hash of each campaign's CONTENT (`cfg.category_cache_path`) so unchanged
+campaigns skip Groq and edited ones re-categorize (`--recategorize` clears the cache). The pass
+runs AFTER intake (so footage titles exist), prints a 20-campaign sample for eyeballing, and
+returns a breakdown (per-category counts, low-confidence total, how far "other" shrank vs the
+keyword tagger) shown in the report. It **degrades to the keyword tagger** when Groq is
+unavailable (no `GROQ_API_KEY` / no `groq` package / `SCOUT_OFFLINE=1`), marked `category_source`
+= groq|cache|keyword_fallback — a run never depends on the model. Pure helpers (`campaign_signals`,
+`content_hash`, `build_batch_prompt`, `parse_batch_response`, `validate_result`, `keyword_result`)
+are network-free/testable.
+
 **Category-level ranking (`scoring.rank_categories`, on top of per-campaign scoring — the
-per-campaign ranking is unchanged and still primary).** Each campaign is multi-tagged into
-ALL categories it fits (`extract.classify_categories` — a sports-podcast counts toward BOTH),
-stored on `rec["categories"]` (alongside the single-best `rec["category"]`). Every RANKABLE
-campaign then contributes its composite to each of its categories; a category's score is an
-aggregate of its members' composites, chosen by the `cfg.category_agg` knob
-(`top5` default | `top3` | `top10` | `average` | `best`; unknown → default). Only rankable
-campaigns count (`_is_rankable`: scraped/refreshed AND not disqualified / rules_unreadable /
-prohibited) — so existing exclusions are respected; the min-VIEW-threshold penalty is NOT an
-exclusion, it already lives in the composite, so a view-floored campaign still counts with its
-penalized score. A category with fewer than `CATEGORY_FULL_MIN` (5) members is flagged `thin`
-(its score rests on a small sample). The ranking (highest score first, each with
+per-campaign ranking is unchanged and still primary).** Each rankable campaign counts toward
+exactly ONE category — its **primary** `rec["category"]` (from the Groq categorizer) — so
+secondary tags never inflate counts (`rec["categories"]` = primary+secondaries is kept for
+reference only). A category's score is an aggregate of its members' composites, chosen by the
+`cfg.category_agg` knob (`top5` default | `top3` | `top10` | `average` | `best`; unknown →
+default). Only rankable campaigns count (`_is_rankable`: scraped/refreshed AND not disqualified /
+rules_unreadable / prohibited) — so existing exclusions are respected; the min-VIEW-threshold
+penalty is NOT an exclusion, it already lives in the composite, so a view-floored campaign still
+counts with its penalized score. A category with fewer than `CATEGORY_FULL_MIN` (5) members is
+flagged `thin` (its score rests on a small sample). The ranking (highest score first, each with
 count/thin/top campaigns) is written to `campaigns.json` (`category_ranking`), the summary MD
 ("## Category ranking"), and the terminal report.
 
@@ -267,6 +295,11 @@ Key module responsibilities:
   never-raise. `probe_campaigns` runs before the social/footage/clipper passes and can add
   the `footage_inaccessible` disqualifier. See the "Footage SUBSTANCE" note above. Also a
   standalone CLI: `python intake.py <source_url> ...`.
+- **`categorize.py`** — Groq campaign categorizer (see the "Categorization" note above). Mirrors
+  the sibling clipper's Groq client (SDK, `llama-3.3-70b-versatile`, rate-limit backoff). Pure
+  signal/hash/prompt/parse/validate helpers are network-free; the orchestration batches, caches
+  by content hash, prints a sample, and degrades to `extract`'s keyword tagger. The `groq`
+  package + `GROQ_API_KEY` are the only external dependency, and their absence is non-fatal.
 
 **Rules readability + Notion exclusion (`resolve_rules_readability`).** The clipper's intake
 can read on-modal rules and Google Docs but NOT Notion pages (JS-rendered). Clipping a campaign
@@ -485,8 +518,9 @@ mounted behind it). So Phase 2 (`open_detail` → `extract_detail(dialog)` →
 
 `whop_profile/` holds the live logged-in session — treat it like a credential. Runtime
 outputs (`campaigns.json`, `campaigns_summary.md`, `campaign_template.json`,
-`proven_clips_result.json`, `proven_clips_cache.json`, `state.json`, `errors.log`,
-`probe_*`) are gitignored.
+`proven_clips_result.json`, `proven_clips_cache.json`, `category_cache.json`, `state.json`,
+`errors.log`, `probe_*`) are gitignored. Categorization needs `GROQ_API_KEY` in the env and
+the `groq` package (in requirements.txt); without them it degrades to the keyword tagger.
 `clip_farms.json` and `my_performance.json` are optional user-maintained input (my own
 recorded results — personal ground truth), not scout outputs; scout never writes them.
 `completed_campaigns.json` (the DONE list) is clipper/user-maintained state — scout reads it
