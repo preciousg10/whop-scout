@@ -100,6 +100,12 @@ def _campaign_block(c, rank):
     lines.append(f"Clippability: {_fmt_clip_short(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
 
+    b = c.get("composite_breakdown") or {}
+    sf = b.get("style_fit")
+    if sf is not None:
+        lines.append(f"Style fit: {sf:.2f} (x{b.get('style_fit_factor')}) "
+                     f"[{b.get('style_fit_basis')}]")
+
     open_to_all = c.get("open_to_all") or "unclear"
     if open_to_all == "yes":
         lines.append("Open to all: yes (instant join)")

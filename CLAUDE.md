@@ -57,7 +57,7 @@ Playwright dependency — test them by importing `extract` directly, no browser 
 `openness_factor`, `repeatable_factor`, `max_payout_factor`, `min_view_threshold_factor`,
 `velocity_factor`/`_band`,
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
-`action_density_factor`, `footage_access_factor`, `project_budget_drain`,
+`action_density_factor`, `footage_access_factor`, `style_fit`, `project_budget_drain`,
 `participant_growth`, `source_saturation_estimate`, `account_reusability`, and their
 `*_factor` companions) and `social.parse_count` are likewise pure. `strategic.py`
 (`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
@@ -177,8 +177,18 @@ along is a strong negative; a FRESH one is neutral, never penalized), `competiti
 (participants per $1k budget), and the four **footage-substance** factors from `intake.py`:
 `content_type_factor` (non-standard = heavy penalty), `footage_supply_factor` (recurring >
 one-time), `action_density_factor` (logistics-heavy = heavy penalty), `footage_access_factor`
-(partial accessibility penalized; full inaccessibility disqualifies). A campaign with any
-**hard disqualifier** (rules-level OR `footage_inaccessible`) is forced to composite 0 — it
+(partial accessibility penalized; full inaccessibility disqualifies). **Style fit**
+(`scoring.style_fit`) is a tunable multiplier ALONGSIDE the money signals (it never replaces
+them) that scores how well a campaign fits a CHAOTIC/high-energy clip channel — stream
+highlights / reactions / gaming / action / memes rank ABOVE polished produced content
+(jewelry, corporate, music videos). It's built only from signals already captured — `category`
+(`extract.classify_category`) plus footage `content_type` + `action_density` (`intake.py`), so
+NO new scraping. One knob tunes it: `scoring.STYLE_FIT_WEIGHT` (default 0.6 → a 0.4×–1.6× swing;
+`0.0` disables it entirely, toward `1.0` lets style dominate) via `factor = 1 + WEIGHT*(2*fit-1)`,
+with the per-category chaos affinities in `STYLE_FIT_CATEGORY` (+ `STYLE_FIT_CONTENT`/
+`STYLE_FIT_DENSITY` nudges) editable to re-profile the channel; neutral/unknown → exactly 1.0.
+Surfaced per campaign in the report ("Style fit: …") and in the composite breakdown. A campaign
+with any **hard disqualifier** (rules-level OR `footage_inaccessible`) is forced to composite 0 — it
 sinks but is shown in the report's DISQUALIFIED section with reasons. On top of these,
 `composite_score` multiplies the six cross-run/strategic factors from `strategic.py` (budget
 drain, participant growth, source saturation, recurring creator, account reusability, and the

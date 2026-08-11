@@ -92,6 +92,45 @@ VELOCITY_MIN_AGE_DAYS = 5.0
 # Max payout per video floor — at/above this a cap doesn't hurt the model.
 MAX_PAYOUT_FLOOR = 300.0
 
+# --- style fit (chaos-clip channel affinity) -----------------------------------
+# How much a campaign's STYLE fits a chaotic/high-energy clip channel (stream highlights,
+# reactions, gaming/action, memes) vs. polished produced content (jewelry, corporate, music
+# videos). Built ONLY from signals already captured — category (extract.classify_category) +
+# footage content-type & action-density (intake.py) — so it adds NO scraping. It's a
+# MULTIPLIER on the composite ALONGSIDE the money signals, never replacing them.
+#
+# STYLE_FIT_WEIGHT is the single tuning knob (the swing): factor = 1 + WEIGHT*(2*fit - 1), so a
+# perfect chaos fit (fit=1) -> (1+WEIGHT)x, polished (fit=0) -> (1-WEIGHT)x, neutral/unknown
+# (fit=0.5) -> exactly 1.0x. Set 0.0 to DISABLE the signal entirely; raise toward 1.0 to make
+# style dominate. Default 0.6 => a 0.4x .. 1.6x swing.
+STYLE_FIT_WEIGHT = 0.6
+STYLE_FIT_FLOOR = 0.1   # never let style alone zero a campaign (money signals still decide)
+
+# Per-category chaos affinity in [0,1] (1 = peak chaos-clippable, 0 = polished/produced).
+# EDIT THIS to re-profile the channel (e.g. a talking-head channel would raise podcast_talking).
+STYLE_FIT_CATEGORY = {
+    "streamer_irl":    1.0,   # stream highlights / IRL / subathons — peak chaos
+    "gaming":          0.9,   # action gameplay
+    "meme":            0.9,   # funny / viral / shitpost
+    "sports":          0.85,  # action moments
+    "podcast_talking": 0.5,   # talking-head — clippable but not chaotic (neutral)
+    "music":           0.25,  # polished / produced
+    "brand_product":   0.15,  # jewelry, corporate, product promos — produced
+    "other":           0.5,   # unknown category — neutral, never a guessed penalty
+}
+# Additive nudges from the footage CONTENT TYPE (intake.py), applied only when known.
+STYLE_FIT_CONTENT = {
+    "standard_stream_vod":     +0.10,  # raw stream footage — chaos-friendly
+    "podcast_interview":        0.0,   # talking — neutral
+    "slideshow_photo":         -0.20,  # produced / static
+    "music_video":             -0.30,  # highly produced
+    "short_form_only_unusual": -0.15,
+    "ugc_requires_my_face":    -0.15,
+    "other":                   -0.10,
+}
+# Additive nudges from the ACTION-DENSITY band (intake.py), applied only when scored.
+STYLE_FIT_DENSITY = {"eventful": +0.15, "mixed": 0.0, "logistics_heavy": -0.25}
+
 
 def _interp_log(x, points):
     """Piecewise-linear-in-log interpolation. `points` = ascending [(x_i, y_i), ...].
@@ -315,6 +354,37 @@ def action_density_factor(density):
         return 1.0
     return {"logistics_heavy": 0.4, "mixed": 1.0, "eventful": 1.15}.get(
         density.get("band"), 1.0)
+
+
+def style_fit(c):
+    """Style-fit for a CHAOTIC/high-energy clip channel, from signals already captured
+    (category + footage content-type + action-density — no new scraping). Returns
+    (factor, detail).
+
+    `factor` multiplies the composite ALONGSIDE the money signals: chaos-clippable content
+    (stream highlights, action, memes) is boosted, polished produced content (jewelry,
+    corporate, music videos) is demoted. A neutral/unknown profile -> exactly 1.0 (never
+    guessed into a penalty). Tune STYLE_FIT_WEIGHT (0 disables) or the STYLE_FIT_* affinity
+    maps to re-profile. `detail` carries the raw fit, weight, and a human-readable basis."""
+    category = c.get("category")
+    base = STYLE_FIT_CATEGORY.get(category, 0.5)
+    parts = [f"category={category or 'unknown'}({base:.2f})"]
+
+    ctype = (c.get("content_type") or {}).get("type")
+    if ctype in STYLE_FIT_CONTENT:
+        base += STYLE_FIT_CONTENT[ctype]
+        parts.append(f"content={ctype}({STYLE_FIT_CONTENT[ctype]:+.2f})")
+
+    dens = c.get("action_density") or {}
+    band = dens.get("band")
+    if dens.get("score") is not None and band in STYLE_FIT_DENSITY:
+        base += STYLE_FIT_DENSITY[band]
+        parts.append(f"action={band}({STYLE_FIT_DENSITY[band]:+.2f})")
+
+    fit = max(0.0, min(1.0, base))
+    factor = max(STYLE_FIT_FLOOR, 1.0 + STYLE_FIT_WEIGHT * (2.0 * fit - 1.0))
+    return round(factor, 4), {"fit": round(fit, 3), "weight": STYLE_FIT_WEIGHT,
+                              "basis": " ".join(parts)}
 
 
 def footage_access_factor(access):
@@ -677,6 +747,10 @@ def composite_score(c):
     access = c.get("footage_access")
     access_fac = footage_access_factor(access)
 
+    # style fit — chaos-clip channel affinity from category + content-type + action-density.
+    # A tunable multiplier ALONGSIDE the money signals (STYLE_FIT_WEIGHT is the knob).
+    style_fac, style_detail = style_fit(c)
+
     # cross-run + strategic signals (filled by strategic.compute_strategic_signals)
     drain = c.get("budget_drain")
     drain_fac = budget_drain_factor(drain)
@@ -707,7 +781,7 @@ def composite_score(c):
     composite = round(
         base * confidence_factor * minimum_penalty * below_min_penalty * mvt_fac
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
-        * ctype_fac * supply_fac * density_fac * access_fac
+        * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
         * dc_fac * open_fac, 6)
     if disqualified:
@@ -765,6 +839,11 @@ def composite_score(c):
         "action_density_factor": density_fac,
         "footage_access_status": (access or {}).get("status"),
         "footage_access_factor": access_fac,
+        # style fit — chaos-clip channel affinity (category + content-type + action-density)
+        "style_fit": style_detail["fit"],
+        "style_fit_weight": style_detail["weight"],
+        "style_fit_basis": style_detail["basis"],
+        "style_fit_factor": style_fac,
         # cross-run + strategic signals
         "budget_days_until_empty": (drain or {}).get("days_until_empty"),
         "budget_drain_band": (drain or {}).get("band"),
