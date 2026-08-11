@@ -48,10 +48,12 @@ CATEGORIES = [
 ]
 _CATEGORY_SET = set(CATEGORIES)
 
-# Categorization is a SIMPLE classification task (far cheaper than caption writing), so the
-# small/fast model is the default — it uses a fraction of the daily token budget. Override with
-# cfg.category_model or $GROQ_MODEL="llama-3.3-70b-versatile" if 8B accuracy proves poor.
-GROQ_MODEL_DEFAULT = "llama-3.1-8b-instant"
+# 70B handles the 20-campaign batches fine (large context). The small 8B-instant was tried but
+# its context window is too small for 20-campaign batches — it 413'd ("request too large"). The
+# daily-TOKEN budget is already handled by the per-run cap + cache (not by shrinking the model),
+# so we stay on 70B. Override with cfg.category_model or $GROQ_MODEL if needed. (A residual 413 on
+# any batch is handled adaptively by splitting the batch — see _categorize_chunk.)
+GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
 # Recorded in the cache for provenance only. We do NOT discard the cache on a version change —
 # re-categorizing all ~450 campaigns every run is what blew the free-tier DAILY token budget.
 # Cached categorizations are always kept; only UNCACHED campaigns are sent to Groq. To force a
@@ -250,6 +252,20 @@ class GroqDailyLimit(Exception):
     this propagates up and stops Groq calls for the rest of the run (remainder → keyword)."""
 
 
+class RequestTooLarge(Exception):
+    """Raised on a 413 'request too large' — the batch exceeds the model's context/limit.
+    Retrying identically can't help; the caller SPLITS the batch and retries the halves."""
+
+
+def _is_request_too_large(msg):
+    """A 413 / oversized-request error (distinct from a rate limit — even when Groq phrases it
+    against TPM). Checked BEFORE rate-limit classification so it isn't mistaken for a wait."""
+    low = msg.lower()
+    return ("413" in msg or "request too large" in low or "request_too_large" in low
+            or "reduce the length" in low or "maximum context length" in low
+            or "context_length_exceeded" in low or "too many tokens" in low)
+
+
 # A required wait longer than this is a daily cap, not a per-minute one — not worth blocking
 # a run for. Per-minute waits are seconds; daily waits are minutes/hours.
 _MAX_MINUTE_WAIT_S = 90.0
@@ -301,6 +317,8 @@ def _groq_chat(client, system, user, model, *, retries=3, max_tokens=2048):
             return resp.choices[0].message.content or ""
         except Exception as e:
             msg = str(e)
+            if _is_request_too_large(msg):          # 413 — split the batch, don't wait/retry
+                raise RequestTooLarge(msg.splitlines()[0][:200])
             kind, wait = _classify_rate_limit(msg)
             if kind == "daily":
                 raise GroqDailyLimit(msg.splitlines()[0][:200])
@@ -340,6 +358,27 @@ def _categorize_batch_retry(client, signals_list, model, *, batch_retries=1, coo
                   f"({attempt + 1}/{batch_retries})…")
             time.sleep(wait)
     return None
+
+
+def _categorize_chunk(client, signals_list, model, *, batch_retries=1):
+    """Categorize a chunk, returning a PER-ITEM list (len == len(signals_list)) of
+    result-dict-or-None. On a 413 'request too large' it SPLITS the chunk in half and retries
+    each half (halving until it fits or down to one campaign), so a batch that's momentarily too
+    big for the model's context shrinks instead of failing wholesale — the safety net for the
+    old 8B 413s and any residual 70B 413. GroqDailyLimit propagates (stops the run); a
+    transient/other failure yields None for those items (→ keyword_fallback, deferred)."""
+    try:
+        res = _categorize_batch_retry(client, signals_list, model, batch_retries=batch_retries)
+    except RequestTooLarge as e:
+        n = len(signals_list)
+        if n <= 1:
+            print(f"    413 on a single campaign — deferring to keyword ({e}).")
+            return [None]
+        mid = n // 2
+        print(f"    413 request too large — splitting {n} into {mid}+{n - mid} and retrying.")
+        return (_categorize_chunk(client, signals_list[:mid], model, batch_retries=batch_retries)
+                + _categorize_chunk(client, signals_list[mid:], model, batch_retries=batch_retries))
+    return list(res) if res is not None else [None] * len(signals_list)
 
 
 # =============================================================================
@@ -489,22 +528,24 @@ def categorize_campaigns(records, cfg, *, recategorize=False, client=None, sampl
             done, transient_fb, daily_hit, daily_msg, stopped_at = 0, 0, False, "", None
 
             for bi, chunk in enumerate(chunks):
-                try:
-                    results = _categorize_batch_retry(
+                try:                                    # per-item results (413 → auto-split)
+                    item_results = _categorize_chunk(
                         client, [s for _r, s, _h in chunk], model, batch_retries=batch_retries)
                 except GroqDailyLimit as e:             # daily quota gone — stop calling Groq
                     daily_hit, daily_msg, stopped_at = True, str(e), bi
                     break
+                got = 0
                 for j, (r, _sig, h) in enumerate(chunk):
-                    if results is None:                 # transient failure exhausted — defer
+                    res = item_results[j]
+                    if res is None:                     # failed / too-large — defer to keyword
                         _apply(r, keyword_result(r), source="keyword_fallback")
                         transient_fb += 1
                     else:
-                        cache[h] = results[j]           # cache ONLY real Groq results
-                        _apply(r, results[j], source="groq")
+                        cache[h] = res                  # cache ONLY real Groq results
+                        _apply(r, res, source="groq")
+                        got += 1
                 done += len(chunk)
-                print(f"    categorized {done}/{len(to_groq)} "
-                      f"({'groq' if results is not None else 'FALLBACK'})")
+                print(f"    categorized {done}/{len(to_groq)} ({got}/{len(chunk)} groq)")
                 if pause and bi < len(chunks) - 1:      # pace to stay under per-minute RPM
                     time.sleep(pause)
 

@@ -213,15 +213,18 @@ few, **titles as TEXT — never downloading video**), and creator (tiebreaker) �
 gaming/music/brand_product/meme/news/movie_tv/other), optional `secondary_categories`, and a
 `category_confidence` (high/low). Guards: the model may ONLY pick from the fixed list (anything
 else → "other"); insufficient/conflicting signals → "other"/low, never a guessed label. The model
-is the cheap/fast `llama-3.1-8b-instant` (override via `cfg.category_model` / `$GROQ_MODEL`) —
-categorization is a simple classification task, so 8B keeps well within the free tier. **Free-tier
-DAILY-budget discipline** (the whole point — categorizing all ~450 at once blew the quota): calls
-are BATCHED (`cfg.category_batch_size`, default 20); results are CACHED by a hash of each
-campaign's CONTENT (`cfg.category_cache_path`) and the cache is ALWAYS kept — a prompt change does
-NOT discard it (re-categorizing everything is what blew the budget); only genuinely UNCACHED
-campaigns go to Groq, capped at `cfg.category_max_new_per_run` (default 120) NEW campaigns per run
-(the rest keep keyword_fallback and are picked up on the next run — Scout runs every few days, so
-the board fills in incrementally). A **daily** rate limit (TPD/RPD, or a "try again" hint longer
+is `llama-3.3-70b-versatile` (override via `cfg.category_model` / `$GROQ_MODEL`) — its large context
+handles the 20-campaign batches; the small 8B-instant was tried but 413'd ("request too large") on
+those batches, and the daily-token budget is handled by the cap+cache below, not by shrinking the
+model. **Free-tier DAILY-budget discipline** (the whole point — categorizing all ~450 at once blew
+the quota): calls are BATCHED (`cfg.category_batch_size`, default 20 — a 413 on any batch
+auto-splits it in half via `_categorize_chunk` until it fits, so residual oversize never fails a
+whole chunk); results are CACHED by a hash of each campaign's CONTENT (`cfg.category_cache_path`)
+and the cache is ALWAYS kept — a prompt change does NOT discard it (re-categorizing everything is
+what blew the budget); only genuinely UNCACHED campaigns go to Groq, capped at
+`cfg.category_max_new_per_run` (default 120) NEW campaigns per run (the rest keep keyword_fallback
+and are picked up on the next run — Scout runs every few days, so the board fills in
+incrementally). A **daily** rate limit (TPD/RPD, or a "try again" hint longer
 than a per-minute window) is detected (`_classify_rate_limit`) and raises `GroqDailyLimit`, which
 STOPS all Groq calls for the rest of the run (remainder → keyword_fallback, deferred) — retrying
 into a dead daily quota only hangs the run; per-minute limits get a few short honored-hint retries
@@ -307,9 +310,10 @@ Key module responsibilities:
   the `footage_inaccessible` disqualifier. See the "Footage SUBSTANCE" note above. Also a
   standalone CLI: `python intake.py <source_url> ...`.
 - **`categorize.py`** — Groq campaign categorizer (see the "Categorization" note above). Mirrors
-  the sibling clipper's Groq client (SDK + rate-limit backoff) but on the cheap `llama-3.1-8b-
-  instant` and hardened for the free-tier DAILY budget (cache always kept, per-run cap on new
-  campaigns, daily-limit detection that stops calling Groq). Pure signal/hash/prompt/parse/validate
+  the sibling clipper's Groq client (SDK + rate-limit backoff) on `llama-3.3-70b-versatile` and
+  hardened for the free-tier DAILY budget (cache always kept, per-run cap on new campaigns,
+  daily-limit detection that stops calling Groq, and 413 batch auto-splitting). Pure
+  signal/hash/prompt/parse/validate
   helpers are network-free; the orchestration batches, caches by content hash, prints a sample, and
   degrades to `extract`'s keyword tagger. The `groq`
   package + `GROQ_API_KEY` are the only external dependency, and their absence is non-fatal.
