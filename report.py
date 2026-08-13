@@ -107,6 +107,18 @@ def _fmt_earn_short(c):
     return "UNKNOWN" if eepc is None else f"${eepc:,.2f}"
 
 
+def _fmt_language(c):
+    """Detected language + whether the non-English derank fired (auditable, per campaign)."""
+    lang = c.get("language") or {}
+    code = lang.get("language") or "unknown"
+    if lang.get("nonenglish"):
+        fac = (c.get("composite_breakdown") or {}).get("language_factor")
+        conf = lang.get("confidence") or "?"
+        basis = lang.get("basis") or ""
+        return f"{code} — NON-ENGLISH derank x{fac} ({conf}; {basis})"
+    return f"{code} (English/ambiguous — no penalty)"
+
+
 def _fmt_budget_short(c):
     rem = c.get("budget_remaining_fraction")
     total = c.get("budget_total")
@@ -121,6 +133,11 @@ def _warning_flags(c):
     """Only real warnings — nothing neutral. Disqualifiers live in their own section."""
     b = c.get("composite_breakdown") or {}
     flags = []
+    lang = c.get("language") or {}
+    if lang.get("nonenglish"):
+        fac = b.get("language_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        flags.append(f"NON-ENGLISH [{lang.get('language')}]{fac_txt}")
     if b.get("expected_below_minimum"):
         flags.append("BELOW-MIN-PAYOUT (typical clip earns $0)")
     if c.get("high_minimum"):
@@ -160,6 +177,7 @@ def _campaign_block(c, rank):
     lines.append(f"Expected earnings/clip: {_fmt_earn_short(c)}")
     lines.append(f"Clippability: {_fmt_clip_short(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
+    lines.append(f"Language: {_fmt_language(c)}")
 
     b = c.get("composite_breakdown") or {}
     sf = b.get("style_fit")
@@ -351,6 +369,11 @@ def write_summary_md(path, campaigns, category_ranking=None, category_summary=No
         f"{len(active)} rankable · {len(disqualified)} disqualified · "
         f"{len(prohibited)} prohibited · {len(unreadable)} rules-unreadable · "
         f"{len(skipped)} pre-filtered · {len(completed)} clipper-done.")
+    noneng = sum(1 for c in active if (c.get("language") or {}).get("nonenglish"))
+    if noneng:
+        lines.append(f"{noneng} of the rankable campaigns detected NON-ENGLISH and deranked "
+                     f"(composite heavily penalized, not excluded — see the Language line / "
+                     f"NON-ENGLISH flag per campaign).")
     lines.append("")
     lines.append("Sorted by composite rank (reach x rate drives it; expected $/clip and "
                  "proven clippability are the heavy levers). Campaigns ranking mostly on "
@@ -479,6 +502,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     active.sort(key=lambda c: (_composite_of(c), _core_known(c), c.get("pre_score", 0)),
                 reverse=True)
     high_min = sum(1 for c in active if c.get("high_minimum"))
+    noneng = sum(1 for c in active if (c.get("language") or {}).get("nonenglish"))
     min_view_gated = sum(1 for c in active if c.get("min_view_threshold"))
     capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
@@ -498,6 +522,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     print(f"  Known, refreshed no re-scrape        : {refreshed}")
     print(f"  Clipper-done (DONE list, excluded)   : {completed}")
     print(f"  Flagged HIGH_MINIMUM                 : {high_min}")
+    print(f"  Non-English (deranked, not excluded) : {noneng}")
     print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
     print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")

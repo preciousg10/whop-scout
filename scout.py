@@ -34,6 +34,7 @@ import extract
 import footage as footage_mod
 import categorize as categorize_mod
 import intake as intake_mod
+import language
 import proven_clips as clips_mod
 import report
 import selectors as S
@@ -58,8 +59,8 @@ class Config:
 
     # once-daily + session caps
     min_hours_between_runs: float = 20.0      # refuse if last run < this (unless --force)
-    max_campaigns: int = 200                  # per-run detail cap
-    max_minutes: float = 90.0                 # per-run wall-clock cap
+    max_campaigns: int = 500                  # per-run detail cap
+    max_minutes: float = 300.0                 # per-run wall-clock cap
 
     # click / interaction resilience — Whop's cross-origin iframe UI is frequently SLOWER
     # than a single click timeout, and most "failures" are transient slowness, not real
@@ -150,6 +151,13 @@ class Config:
     # many views (min_payout / pay_per_1k * 1000) is flagged HIGH_MINIMUM and
     # deprioritized hard — a normal ~1k-view clip would earn nothing.
     min_payout_max_views: float = 1000.0
+
+    # Non-English derank (English-only operation). A campaign whose text (name + rules +
+    # modal + creator handle/description) reads as CLEARLY non-English gets its composite
+    # multiplied by this — a heavy derank (~85% off), NOT a hard exclude. Detection is a
+    # cheap offline stopword heuristic (language.py, NO Groq); ambiguous/short text fails
+    # OPEN (factor 1.0), so English composites are left EXACTLY unchanged.
+    nonenglish_penalty: float = 0.15
 
     # output paths
     state_path: str = "state.json"
@@ -826,6 +834,15 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["excluded_prohibited"] = bool(prohibited)
     rec["excluded_prohibited_reason"] = prohibited["reason"] if prohibited else None
     rec["excluded_prohibited_borderline"] = bool(prohibited and prohibited["borderline"])
+
+    # LANGUAGE — Scout is an English-only operation, so a clearly non-English campaign
+    # (Spanish/Portuguese/French, or a non-Latin script) is DERANKED (not excluded). Offline
+    # stopword heuristic (NO Groq/network); fails OPEN — short/ambiguous text is assumed
+    # English so we never wrongly derank. The resolved factor is stored so composite_score
+    # just multiplies it (English/unknown -> 1.0, leaving English composites EXACTLY unchanged).
+    lang = language.detect_language(language.language_text(rec))
+    rec["language"] = lang
+    rec["language_penalty_factor"] = cfg.nonenglish_penalty if lang.get("nonenglish") else 1.0
 
     # campaign age (first_seen carried across runs) + payout velocity
     first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \

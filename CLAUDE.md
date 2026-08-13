@@ -36,7 +36,7 @@ python scout.py --mark-done <campaign-id> [<id> ...]
 python scout.py --unmark-done <campaign-id> [<id> ...]   # restore to the board
 
 # syntax check all modules
-python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py
+python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py language.py
 
 # probe a campaign's footage substance directly (accessibility/type/volume/density)
 python intake.py https://www.youtube.com/watch?v=<id> https://drive.google.com/drive/folders/<id>
@@ -65,7 +65,8 @@ and their `*_factor` companions) and `social.parse_count` are likewise pure. `ca
 signal/hash/prompt/parse/validate layer (`campaign_signals`, `content_hash`, `build_batch_prompt`,
 `parse_batch_response`, `validate_result`, `keyword_result`) is testable with no Groq/network.
 `strategic.py`
-(`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
+(`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. `language.py`
+(`detect_language`, `language_text`) is a pure offline detector — no network/Groq. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
 `classify_content_type`, `analyze_transcript_density`, `aggregate_access`,
 `footage_volume`) — test the substance logic with no network. So is the analysis layer of `proven_clips.py` (`clip_performance`,
 `aggregate_clippability`, `score_candidate`, `filter_clips`, `analyze_text_patterns`,
@@ -268,6 +269,18 @@ surfaces as a `CAPTURE-SUSPECT` report warning instead of passing as "no docs" �
 ONLY, it never touches capture logic. It reads only already-scraped fields, so it's pure/cheap
 and idempotent.
 
+**Non-English derank (`language.py` + `cfg.nonenglish_penalty`, default 0.15).** Scout is an
+ENGLISH-ONLY operation, so a campaign whose cheap text (name + rules + modal + creator
+handle/description) reads as CLEARLY non-English (Spanish/Portuguese/French via a stopword-ratio
+heuristic, or a non-Latin script) has its composite multiplied by `cfg.nonenglish_penalty` — a
+heavy DERANK (~85% off), NOT a hard exclude (it sinks but stays on the board). Detection is
+OFFLINE and Groq-free (`language.detect_language`, a pure function) and FAILS OPEN: short or
+ambiguous text returns `nonenglish=False` (factor 1.0), so English composites are left EXACTLY
+unchanged. `enrich_active` stores `rec["language"]` (detected language + `nonenglish` +
+confidence + basis) and the resolved `rec["language_penalty_factor"]`; `composite_score`
+multiplies that factor in and records it in the breakdown. Surfaced per campaign in
+`campaigns_summary.md` (a "Language:" line + a `NON-ENGLISH` flag) and counted in the report.
+
 **Application/selection gate (`open_to_all` + the `application_gated` disqualifier).** A
 campaign that isn't an instant open join — you must apply, be accepted/approved, get invited,
 or wait for a spot (e.g. Medal's "Content Program") — is unusable for a pipeline that must
@@ -303,6 +316,10 @@ Key module responsibilities:
   reusability. `compute_strategic_signals` runs in `assemble` before scoring. Pure math +
   factors live in `scoring.py`. The `my_performance.json` (user-maintained ground truth of
   my real results) + `scoring.performance_factor` are the unbuilt learning hook.
+- **`language.py`** — offline, Groq-free language detector for the non-English derank (see
+  the "Non-English derank" note above). Non-Latin-script check + English-vs-es/pt/fr
+  stopword-ratio heuristic; `detect_language` fails OPEN on short/ambiguous text. Pure/testable,
+  no network. Called from `enrich_active`; the factor lands in `composite_score`.
 - **`intake.py`** — footage SUBSTANCE probe (ported/adapted from the clipper project's
   `intake.py`/`analyze.py`/`download.py`). Accessibility + content-type + volume/refresh +
   action-density, metadata-only, HTTP-first (yt-dlp optional), cached per campaign,

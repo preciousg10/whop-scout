@@ -775,6 +775,13 @@ def composite_score(c):
     open_to_all = c.get("open_to_all") or "unclear"
     open_fac = openness_factor(open_to_all)
 
+    # non-English derank — heavy penalty for a clearly non-English campaign (English-only op).
+    # The factor is resolved upstream in enrich_active from cfg.nonenglish_penalty; a missing/
+    # English/ambiguous campaign carries 1.0, leaving English composites EXACTLY unchanged.
+    lang = c.get("language") or {}
+    lang_fac = c.get("language_penalty_factor")
+    lang_fac = lang_fac if isinstance(lang_fac, (int, float)) and lang_fac > 0 else 1.0
+
     disqualified = bool(c.get("disqualifiers"))
 
     # Base is now driven by REACH (primary) and only nudged by the pay rate (modest) —
@@ -785,7 +792,7 @@ def composite_score(c):
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
-        * dc_fac * open_fac, 6)
+        * dc_fac * open_fac * lang_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -866,6 +873,11 @@ def composite_score(c):
         # openness — open to an instant join (yes/no/unclear); gated is a hard DQ
         "open_to_all": open_to_all,
         "openness_factor": open_fac,
+        # non-English derank (English-only op) — 1.0 for English/ambiguous (no change)
+        "language": lang.get("language"),
+        "language_nonenglish": bool(lang.get("nonenglish")),
+        "language_confidence": lang.get("confidence"),
+        "language_factor": lang_fac,
         "disqualified": disqualified,
         "composite": composite,
     }
