@@ -169,6 +169,63 @@ def pay_rate_factor(pay_per_1k):
                               (5.0, 1.3), (10.0, 1.4)]), 4)
 
 
+# --- budget as ABSOLUTE DOLLARS remaining (not a bare percentage) ---------------
+# A budget signal read as a bare FRACTION is meaningless without the total: "90% left"
+# on a $10,000 campaign is $9,000 (a real pool); "90% left" on a $100 campaign is $90
+# (worthless) — yet the old base multiplied by the fraction alone, so they scored the
+# same. So the budget lever is now driven by ACTUAL DOLLARS REMAINING = total × fraction.
+# Log-scaled: a near-empty pool floors low (~0.15), an ordinary pool is neutral (~$2k →
+# 1.0), a huge pool boosts (up to ~2.6). Near-empty still sinks because tiny fraction →
+# tiny dollars regardless of total.
+BUDGET_DOLLAR_POINTS = [
+    (50, 0.15), (150, 0.30), (400, 0.50), (900, 0.70), (2000, 1.00),
+    (5000, 1.35), (15000, 1.80), (40000, 2.20), (100000, 2.60),
+]
+# The big-budget BOOST (the part of budget_factor above the neutral 1.0) is only "real
+# earning opportunity" if the pay rate is decent — a $100k pool at a garbage $0.10/1k CPM
+# is not a $100k opportunity. So the boost above neutral is scaled by this rate-quality
+# fraction (0..1). Pay rate ALSO keeps its own separate `pay_rate_factor` lever; this only
+# gates the budget BONUS (never adds a second penalty — the near-empty/ordinary floor at or
+# below 1.0 is untouched). Unknown rate → full boost (1.0), so it's never a guessed penalty.
+BUDGET_RATE_QUALITY_POINTS = [
+    (0.10, 0.25), (0.25, 0.35), (0.50, 0.50), (1.00, 0.70), (2.00, 0.90), (3.00, 1.00),
+]
+
+
+def budget_dollars_remaining(c):
+    """Actual dollars still in the pool = budget_total × budget_remaining_fraction, or None
+    (UNKNOWN) when either is missing. Pure — reads already-scraped fields."""
+    total = c.get("budget_total")
+    frac = c.get("budget_remaining_fraction")
+    if not isinstance(total, (int, float)) or isinstance(total, bool):
+        return None
+    if not isinstance(frac, (int, float)) or isinstance(frac, bool):
+        return None
+    return max(0.0, total * frac)
+
+
+def _budget_rate_quality(pay_per_1k):
+    """Fraction (0..1) of the big-budget boost a campaign's pay rate earns. Unknown rate ->
+    1.0 (full boost — never a guessed penalty; pay_rate_factor covers rate quality itself)."""
+    if not pay_per_1k:
+        return 1.0
+    return round(_interp_log(pay_per_1k, BUDGET_RATE_QUALITY_POINTS), 4)
+
+
+def budget_factor(dollars_remaining, pay_per_1k):
+    """Budget lever from ABSOLUTE dollars remaining (replaces the old bare-fraction multiplier).
+    Log-scaled: near-empty floors (~0.15), ordinary (~$2k) is neutral 1.0, huge pools boost
+    (up to ~2.6). The boost ABOVE neutral is tempered by pay rate (a huge pool at a garbage CPM
+    isn't real earning opportunity), while the at/below-neutral range is untouched so a small or
+    near-empty pool always sinks. Unknown dollars -> neutral 1.0 (never guessed)."""
+    if dollars_remaining is None:
+        return 1.0
+    raw = _interp_log(dollars_remaining, BUDGET_DOLLAR_POINTS)
+    if raw <= 1.0:
+        return round(raw, 4)
+    return round(1.0 + (raw - 1.0) * _budget_rate_quality(pay_per_1k), 4)
+
+
 def reach_factor(reach):
     """Creator reach/popularity — a PRIMARY view-driver, deliberately WIDE (~0.6x..2.8x)
     so it dominates the pay rate (which spans only ~0.75x..1.4x). `reach` is recent
@@ -695,6 +752,12 @@ def composite_score(c):
     pay_fac = pay_rate_factor(pay)  # pay is now a MODEST nudge, not the primary driver
     rem = c.get("budget_remaining_fraction")
     rem = rem if rem is not None else 0.0
+    # Budget lever = ACTUAL DOLLARS REMAINING (total × fraction), not the bare fraction — "90%
+    # left" is $9k on a $10k pool but $90 on a $100 pool, and those must NOT score the same.
+    # The big-budget boost is tempered by the pay rate (real money AT a decent rate); pay rate
+    # also keeps its own separate lever above.
+    dollars_rem = budget_dollars_remaining(c)
+    budget_fac = budget_factor(dollars_rem, pay)
     clip = clippability(c)
 
     reach_val, reach_basis = _reach_input(c)
@@ -784,9 +847,10 @@ def composite_score(c):
 
     disqualified = bool(c.get("disqualifiers"))
 
-    # Base is now driven by REACH (primary) and only nudged by the pay rate (modest) —
-    # views dominate rate. Expected-earnings-per-clip (reach × rate) is a heavy top lever.
-    base = rem * clip * reach_fac * pay_fac
+    # Base is driven by ABSOLUTE budget dollars (not bare %) and REACH (primary), only nudged
+    # by the pay rate (modest) — views dominate rate. Expected-earnings-per-clip (reach × rate)
+    # is a heavy top lever.
+    base = budget_fac * clip * reach_fac * pay_fac
     composite = round(
         base * confidence_factor * minimum_penalty * below_min_penalty * mvt_fac
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
@@ -801,6 +865,10 @@ def composite_score(c):
         "pay_per_1k": pay,
         "pay_rate_factor": pay_fac,
         "budget_remaining_fraction": round(rem, 4),
+        # budget as ABSOLUTE dollars remaining (total × fraction) — the real pool size, not a %
+        "budget_total": c.get("budget_total"),
+        "budget_dollars_remaining": round(dollars_rem, 2) if dollars_rem is not None else None,
+        "budget_factor": budget_fac,
         "reach_value": reach_val,
         "reach_basis": reach_basis,
         "reach_factor": reach_fac,
