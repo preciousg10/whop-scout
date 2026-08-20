@@ -35,6 +35,7 @@ import footage as footage_mod
 import categorize as categorize_mod
 import intake as intake_mod
 import language
+import liveness as liveness_mod
 import proven_clips as clips_mod
 import report
 import selectors as S
@@ -158,6 +159,20 @@ class Config:
     # cheap offline stopword heuristic (language.py, NO Groq); ambiguous/short text fails
     # OPEN (factor 1.0), so English composites are left EXACTLY unchanged.
     nonenglish_penalty: float = 0.15
+
+    # Footage LINK-LIVENESS derank (liveness.py). A campaign whose footage links are all
+    # DEAD/OFFLINE (removed video, empty/locked Drive folder, stream channel with no VODs)
+    # is a waste of the clipper's time, so its composite is multiplied by this — a HEAVY
+    # derank (~85% off), NOT a hard exclude (a probe can false-negative on rate-limiting/
+    # outage, so the campaign stays visible far down). The check is metadata-only, cached
+    # per LINK across runs (TTL), spaced, and FAILS OPEN — an errored/blocked/inconclusive
+    # probe is UNKNOWN and never penalizes. Fires ONLY when sources are affirmatively dead
+    # and NONE are alive. This is an off-Whop analysis probe (hits YouTube/Kick, not Whop).
+    liveness_enabled: bool = True
+    liveness_dead_penalty: float = 0.15
+    liveness_cache_path: str = "liveness_cache.json"   # per-link verdict cache (dedupe + TTL)
+    liveness_cache_max_age_days: int = 7               # reuse a live/dead link verdict this long
+    liveness_probe_spacing: tuple = (1.0, 3.0)         # random sleep between FRESH probes (gentle)
 
     # output paths
     state_path: str = "state.json"
@@ -2074,6 +2089,12 @@ def main():
             # so an undownloadable-footage campaign is sunk before we spend effort on it).
             # Judges what I'd actually be clipping, not just the stats. Cached per campaign.
             intake_mod.probe_campaigns(results, cfg, pacer)
+            # FOOTAGE LINK-LIVENESS — a metadata-only "is the footage actually still there?"
+            # check (distinct from intake's accessibility): removed videos, empty/locked Drive
+            # folders, offline-live-only stream channels. Dead-and-nothing-alive -> heavy derank
+            # (composite × cfg.liveness_dead_penalty), never an exclude. Cached per link, spaced,
+            # fail-open. Off-Whop (hits YouTube/Kick), so it runs in the analysis phase.
+            liveness_mod.probe_campaigns(results, cfg)
             social_mod.probe_sources(results, cfg.social_top_n, pacer)
             footage_mod.probe_campaigns(results, cfg.footage_top_n, pacer)
             # Measure repeatable clippability from dedicated clipper accounts. Runtime

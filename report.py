@@ -129,6 +129,20 @@ def _fmt_budget_short(c):
     return f"{rem * 100:.0f}%"
 
 
+def _fmt_liveness(c):
+    """Footage link-liveness summary line (status + the derank when it fired)."""
+    live = c.get("liveness") or {}
+    status = live.get("status")
+    if not status or status == "no_links":
+        return "n/a (no footage links)"
+    reason = (live.get("reason") or "").strip()
+    if live.get("penalized"):
+        fac = (c.get("composite_breakdown") or {}).get("liveness_factor")
+        fac_txt = f" — DEAD, composite x{fac}" if fac is not None else " — DEAD"
+        return f"{status}{fac_txt} ({reason})"
+    return f"{status} ({reason})" if reason else status
+
+
 def _warning_flags(c):
     """Only real warnings — nothing neutral. Disqualifiers live in their own section."""
     b = c.get("composite_breakdown") or {}
@@ -154,6 +168,10 @@ def _warning_flags(c):
         flags.append(f"non-standard footage ({ct['type']})")
     if (c.get("footage_access") or {}).get("status") == "partial":
         flags.append("footage partially inaccessible")
+    if (c.get("liveness") or {}).get("penalized"):
+        fac = b.get("liveness_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        flags.append(f"DEAD-FOOTAGE{fac_txt}")
     return flags
 
 
@@ -176,6 +194,7 @@ def _campaign_block(c, rank):
     lines.append(f"Pay: {pay_txt} · Budget remaining: {_fmt_budget_short(c)}")
     lines.append(f"Expected earnings/clip: {_fmt_earn_short(c)}")
     lines.append(f"Clippability: {_fmt_clip_short(c)}")
+    lines.append(f"Footage liveness: {_fmt_liveness(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
     lines.append(f"Language: {_fmt_language(c)}")
 

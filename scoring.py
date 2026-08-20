@@ -311,6 +311,15 @@ def data_confidence_factor(known_count):
     return DATA_CONFIDENCE_FACTORS.get(known_count, 1.0)
 
 
+def liveness_factor(liveness_penalty_factor):
+    """Footage link-liveness derank. The resolved factor is computed upstream (liveness.py
+    sets rec['liveness_penalty_factor'] = cfg.liveness_dead_penalty when all footage is dead,
+    else 1.0), so this just validates it: a positive number is used as-is, anything else ->
+    neutral 1.0 (fail-open — a live/unknown/unchecked campaign is EXACTLY unchanged)."""
+    f = liveness_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
 def openness_factor(open_to_all):
     """Weight campaigns open to an instant free join UP (the pipeline needs to start clipping
     immediately). 'yes' -> 1.1 (a plus), 'unclear' -> 1.0 (neutral — never guessed), 'no' ->
@@ -845,6 +854,12 @@ def composite_score(c):
     lang_fac = c.get("language_penalty_factor")
     lang_fac = lang_fac if isinstance(lang_fac, (int, float)) and lang_fac > 0 else 1.0
 
+    # footage link-liveness derank — heavy penalty when ALL footage links are dead/offline
+    # (resolved upstream in liveness.probe_campaign from cfg.liveness_dead_penalty). Live/
+    # unknown/unchecked -> 1.0 (fail-open), leaving those composites EXACTLY unchanged.
+    live = c.get("liveness") or {}
+    live_fac = liveness_factor(c.get("liveness_penalty_factor"))
+
     disqualified = bool(c.get("disqualifiers"))
 
     # Base is driven by ABSOLUTE budget dollars (not bare %) and REACH (primary), only nudged
@@ -856,7 +871,7 @@ def composite_score(c):
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
-        * dc_fac * open_fac * lang_fac, 6)
+        * dc_fac * open_fac * lang_fac * live_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -946,6 +961,10 @@ def composite_score(c):
         "language_nonenglish": bool(lang.get("nonenglish")),
         "language_confidence": lang.get("confidence"),
         "language_factor": lang_fac,
+        # footage link-liveness — heavy derank when all footage is dead/offline (fail-open)
+        "liveness_status": live.get("status"),
+        "liveness_penalized": bool(live.get("penalized")),
+        "liveness_factor": live_fac,
         "disqualified": disqualified,
         "composite": composite,
     }

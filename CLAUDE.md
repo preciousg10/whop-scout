@@ -36,7 +36,7 @@ python scout.py --mark-done <campaign-id> [<id> ...]
 python scout.py --unmark-done <campaign-id> [<id> ...]   # restore to the board
 
 # syntax check all modules
-python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py language.py
+python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py language.py liveness.py
 
 # probe a campaign's footage substance directly (accessibility/type/volume/density)
 python intake.py https://www.youtube.com/watch?v=<id> https://drive.google.com/drive/folders/<id>
@@ -66,7 +66,9 @@ signal/hash/prompt/parse/validate layer (`campaign_signals`, `content_hash`, `bu
 `parse_batch_response`, `validate_result`, `keyword_result`) is testable with no Groq/network.
 `strategic.py`
 (`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. `language.py`
-(`detect_language`, `language_text`) is a pure offline detector — no network/Groq. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
+(`detect_language`, `language_text`) is a pure offline detector — no network/Groq. `liveness.py`'s
+decision layer (`campaign_liveness`, `classify_link_verdict`, `_normalize_channel_videos_url`)
+is pure/testable with no network — feed it plain verdict dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
 `classify_content_type`, `analyze_transcript_density`, `aggregate_access`,
 `footage_volume`) — test the substance logic with no network. So is the analysis layer of `proven_clips.py` (`clip_performance`,
 `aggregate_clippability`, `score_candidate`, `filter_clips`, `analyze_text_patterns`,
@@ -90,6 +92,8 @@ circular deps). Data flows in one direction:
 → `enrich_active` derives every rules-level analysis dimension (see below)
 → **`intake.probe_campaigns` runs FIRST** (footage substance — accessibility is a hard
   disqualifier, so an undownloadable campaign is sunk before further effort)
+→ **`liveness.probe_campaigns`** (footage LINK-liveness — dead/offline footage heavy-deranks;
+  see below) runs right after intake
 → `scoring.pre_score` → `social.probe_sources` + `footage.probe_campaigns` +
 `proven_clips.probe_campaigns` (ALL non-disqualified campaigns)
 → `categorize.categorize_campaigns` (Groq primary/secondary/confidence — runs after intake so
@@ -134,9 +138,17 @@ each unknown input mapping to a NEUTRAL 1.0 (surfaced as UNKNOWN, never guessed)
 ~0.75–1.4×), while creator reach (`reach_factor`, ~0.6–2.8×) and **expected earnings per
 clip** (`earnings_factor`, ~0.3–2.5×) drive the rank — a $0.50/1k campaign for a huge,
 highly clippable creator beats a $3/1k one for a small creator whose clips get 800 views.
-`base = budget_remaining × clippability × reach_factor × pay_rate_factor`, then
+`base = budget_factor × clippability × reach_factor × pay_rate_factor`, then
 `× confidence × min_penalty × below_min_penalty × earnings_factor × data_confidence_factor`
 and the analysis levers.
+**Budget is scored by ABSOLUTE DOLLARS REMAINING, not a bare percentage** (`scoring.budget_factor`
+on `budget_dollars_remaining` = `budget_total × budget_remaining_fraction`): "90% remaining" is
+$9,000 on a $10k pool but $90 on a $100 pool, and those must NOT score the same, yet the old base
+multiplied by the raw fraction alone. The lever is log-scaled (near-empty ~0.15, ~$2k neutral 1.0,
+huge pools up to ~2.6); near-empty still sinks because a tiny fraction → tiny dollars regardless of
+total. The big-budget BOOST above neutral is tempered by the pay rate (`_budget_rate_quality`) — a
+huge pool at a garbage CPM isn't real earning opportunity — while `pay_rate_factor` stays a
+SEPARATE lever, so the two together favor real money AT a decent rate. Dollars UNKNOWN → neutral 1.0.
 **Expected earnings per clip** = proven clipper MEDIAN views (`repeatable_clippability.
 median_views`, from `proven_clips`) × `pay_per_1k` / 1000 — the number that actually
 matters (what a typical clip earns me), UNKNOWN/neutral when clipper data or the rate is
@@ -281,6 +293,31 @@ confidence + basis) and the resolved `rec["language_penalty_factor"]`; `composit
 multiplies that factor in and records it in the breakdown. Surfaced per campaign in
 `campaigns_summary.md` (a "Language:" line + a `NON-ENGLISH` flag) and counted in the report.
 
+**Footage LINK-LIVENESS derank (`liveness.py` + `cfg.liveness_dead_penalty`, default 0.15).**
+Distinct from intake's *accessibility* ("did the URL respond?"): liveness asks "does the link
+resolve to actual, watchable content?" — a Kick channel that is offline-live-only, or a YouTube
+channel with zero uploads, RESPONDS while offering nothing to clip. A campaign whose footage links
+are ALL dead/offline (removed video → playability `ERROR`/`UNPLAYABLE`; empty/`__NEXT__`-locked
+Drive folder; stream channel with no VODs; 404/410 direct file) has its composite multiplied by
+`cfg.liveness_dead_penalty` — a HEAVY derank (~85% off), NOT a hard exclude (a probe can
+false-negative on rate-limiting/outage, so it stays visible far down). The check is **metadata-only**
+(playability markers, yt-dlp `--flat-playlist` counts, HEAD requests — NEVER a download), **cached
+per LINK across campaigns AND runs** (`liveness_cache.json`, `cfg.liveness_cache_max_age_days` TTL;
+UNKNOWN verdicts are treated as stale so they retry sooner), **spaced** (`cfg.liveness_probe_spacing`
+random sleep between FRESH probes only — cache hits don't sleep), and **FAILS OPEN**: an errored,
+timed-out, rate-limited, walled (login/age/Kick-403), or inconclusive probe is `unknown`, which NEVER
+penalizes — a failed probe is not a dead link. The derank fires ONLY when sources are AFFIRMATIVELY
+dead and NONE are alive (a campaign with any live footage, or only-inconclusive probes, is
+untouched). YouTube channel URLs are normalized to `/videos` before listing (a bare `@handle` lists
+channel TABS, not uploads — the artifact that made a 20-upload channel look like it had "2 videos").
+Pure/testable decision layer (`campaign_liveness`, `classify_link_verdict`,
+`_normalize_channel_videos_url`); the network probes never raise. `liveness.probe_campaigns` runs
+after intake (off-Whop — hits YouTube/Kick, not Whop — so it lives in the uncapped analysis phase);
+`enrich`-adjacent it stores `rec["liveness"]` (per-source verdicts + campaign status/penalized) and
+the resolved `rec["liveness_penalty_factor"]`, which `composite_score` multiplies via
+`scoring.liveness_factor`. Surfaced per campaign in `campaigns_summary.md` (a "Footage liveness:" line
++ a `DEAD-FOOTAGE` flag). Also a standalone CLI: `python liveness.py <source_url> ...`.
+
 **Application/selection gate (`open_to_all` + the `application_gated` disqualifier).** A
 campaign that isn't an instant open join — you must apply, be accepted/approved, get invited,
 or wait for a spot (e.g. Medal's "Content Program") — is unusable for a pipeline that must
@@ -320,6 +357,14 @@ Key module responsibilities:
   the "Non-English derank" note above). Non-Latin-script check + English-vs-es/pt/fr
   stopword-ratio heuristic; `detect_language` fails OPEN on short/ambiguous text. Pure/testable,
   no network. Called from `enrich_active`; the factor lands in `composite_score`.
+- **`liveness.py`** — footage LINK-liveness probe (see the "Footage LINK-LIVENESS derank"
+  note above). Metadata-only "is the footage actually still there?" check (removed videos,
+  empty/locked Drive folders, offline-live-only stream channels) that HEAVY-deranks a
+  fully-dead campaign, never excludes. Cached per link across runs (`liveness_cache.json`, TTL),
+  spaced, FAIL-OPEN (errored/blocked/walled/inconclusive → UNKNOWN → no penalty). Pure decision
+  layer (`campaign_liveness`/`classify_link_verdict`/`_normalize_channel_videos_url`) is
+  network-free/testable; probes reuse intake's HTTP/yt-dlp helpers and never raise. Called from
+  `main` after intake; the factor lands in `composite_score` via `scoring.liveness_factor`.
 - **`intake.py`** — footage SUBSTANCE probe (ported/adapted from the clipper project's
   `intake.py`/`analyze.py`/`download.py`). Accessibility + content-type + volume/refresh +
   action-density, metadata-only, HTTP-first (yt-dlp optional), cached per campaign,
@@ -552,8 +597,8 @@ mounted behind it). So Phase 2 (`open_detail` → `extract_detail(dialog)` →
 
 `whop_profile/` holds the live logged-in session — treat it like a credential. Runtime
 outputs (`campaigns.json`, `campaigns_summary.md`, `campaign_template.json`,
-`proven_clips_result.json`, `proven_clips_cache.json`, `category_cache.json`, `state.json`,
-`errors.log`, `probe_*`) are gitignored. Categorization needs `GROQ_API_KEY` in the env and
+`proven_clips_result.json`, `proven_clips_cache.json`, `category_cache.json`, `liveness_cache.json`,
+`state.json`, `errors.log`, `probe_*`) are gitignored. Categorization needs `GROQ_API_KEY` in the env and
 the `groq` package (in requirements.txt); without them it degrades to the keyword tagger.
 `clip_farms.json` and `my_performance.json` are optional user-maintained input (my own
 recorded results — personal ground truth), not scout outputs; scout never writes them.
