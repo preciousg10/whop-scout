@@ -143,6 +143,43 @@ def _fmt_liveness(c):
     return f"{status} ({reason})" if reason else status
 
 
+def _fmt_footage_presence(c):
+    """Footage-presence summary line: does a PUBLIC downloadable footage link exist at all?
+    'Footage: 0 public links -> NO-FOOTAGE x0.15' vs 'Footage: 2 public links'."""
+    fp = c.get("footage_presence") or {}
+    has = fp.get("has_public_footage")
+    n = fp.get("footage_link_count")
+    if has is None:
+        return "presence undeterminable (detail not loaded — fail-open, no penalty)"
+    if has is False:
+        fac = (c.get("composite_breakdown") or {}).get("footage_presence_factor")
+        fac_txt = f" → NO-FOOTAGE x{fac}" if fac is not None else " → NO-FOOTAGE"
+        return f"0 public links{fac_txt} ({fp.get('reason')})"
+    return f"{n} public link{'s' if n != 1 else ''}"
+
+
+def _fmt_payout(c):
+    """Payout-health summary line: submissions / tracked-age / paid-out + the verdict. Shows
+    the numbers the judgment rests on ('52 subs / 20d / $0 paid -> DEAD-PAYOUT x0.2')."""
+    ph = c.get("payout_health") or {}
+    status = ph.get("status")
+    if not status or status in ("unknown", "disabled"):
+        return f"n/a ({ph.get('reason') or 'not judged'})"
+    subs = ph.get("submissions")
+    days = ph.get("days_open")
+    paid = ph.get("paid_out")
+    subs_txt = f"{int(subs)} subs" if isinstance(subs, (int, float)) else "? subs"
+    days_txt = f"{days:.0f}d" if isinstance(days, (int, float)) else "?d"
+    paid_txt = f"${paid:,.0f} paid" if isinstance(paid, (int, float)) else "$? paid"
+    head = f"{subs_txt} / {days_txt} / {paid_txt}"
+    if status == "dead":
+        fac = (c.get("composite_breakdown") or {}).get("payout_factor")
+        return f"{head} → DEAD-PAYOUT x{fac} ({ph.get('reason')})"
+    if status == "healthy":
+        return f"{head} → healthy ({ph.get('reason')})"
+    return f"{head} → {status} ({ph.get('reason')})"
+
+
 def _warning_flags(c):
     """Only real warnings — nothing neutral. Disqualifiers live in their own section."""
     b = c.get("composite_breakdown") or {}
@@ -172,6 +209,17 @@ def _warning_flags(c):
         fac = b.get("liveness_factor")
         fac_txt = f" (composite x{fac})" if fac is not None else ""
         flags.append(f"DEAD-FOOTAGE{fac_txt}")
+    if (c.get("footage_presence") or {}).get("has_public_footage") is False:
+        fac = b.get("footage_presence_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        flags.append(f"NO-FOOTAGE (no public footage link){fac_txt}")
+    if (c.get("payout_health") or {}).get("status") == "dead":
+        ph = c.get("payout_health") or {}
+        fac = b.get("payout_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        subs = ph.get("submissions")
+        subs_txt = f"{int(subs)} subs, " if isinstance(subs, (int, float)) else ""
+        flags.append(f"DEAD-PAYOUT ({subs_txt}~$0 paid){fac_txt}")
     return flags
 
 
@@ -194,7 +242,9 @@ def _campaign_block(c, rank):
     lines.append(f"Pay: {pay_txt} · Budget remaining: {_fmt_budget_short(c)}")
     lines.append(f"Expected earnings/clip: {_fmt_earn_short(c)}")
     lines.append(f"Clippability: {_fmt_clip_short(c)}")
+    lines.append(f"Footage: {_fmt_footage_presence(c)}")
     lines.append(f"Footage liveness: {_fmt_liveness(c)}")
+    lines.append(f"Payout: {_fmt_payout(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
     lines.append(f"Language: {_fmt_language(c)}")
 
@@ -393,6 +443,13 @@ def write_summary_md(path, campaigns, category_ranking=None, category_summary=No
         lines.append(f"{noneng} of the rankable campaigns detected NON-ENGLISH and deranked "
                      f"(composite heavily penalized, not excluded — see the Language line / "
                      f"NON-ENGLISH flag per campaign).")
+    nofoot = sum(1 for c in active
+                 if (c.get("footage_presence") or {}).get("has_public_footage") is False)
+    if nofoot:
+        lines.append(f"{nofoot} of the rankable campaigns expose NO public footage link and "
+                     f"were deranked (footage member-gated or absent — can't be clipped from "
+                     f"the auto-run; heavily penalized, not excluded — see the Footage line / "
+                     f"NO-FOOTAGE flag per campaign).")
     lines.append("")
     lines.append("Sorted by composite rank (reach x rate drives it; expected $/clip and "
                  "proven clippability are the heavy levers). Campaigns ranking mostly on "
@@ -523,6 +580,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     high_min = sum(1 for c in active if c.get("high_minimum"))
     noneng = sum(1 for c in active if (c.get("language") or {}).get("nonenglish"))
     min_view_gated = sum(1 for c in active if c.get("min_view_threshold"))
+    dead_payout = sum(1 for c in active if (c.get("payout_health") or {}).get("status") == "dead")
     capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
@@ -543,6 +601,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     print(f"  Flagged HIGH_MINIMUM                 : {high_min}")
     print(f"  Non-English (deranked, not excluded) : {noneng}")
     print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
+    print(f"  DEAD-PAYOUT (active but ~$0 paid)    : {dead_payout}")
     print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")

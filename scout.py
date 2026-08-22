@@ -160,6 +160,24 @@ class Config:
     # OPEN (factor 1.0), so English composites are left EXACTLY unchanged.
     nonenglish_penalty: float = 0.15
 
+    # PAYOUT-HEALTH derank (scoring.payout_health). Scout scores POTENTIAL (budget/CPM/reach)
+    # but is otherwise blind to whether a campaign ACTUALLY pays. A paying-dead trap — open a
+    # while, meaningful submissions, yet ~$0 ever paid out (the SomSleep case) — is heavy-
+    # deranked (composite × payout_dead_penalty), NOT excluded. A genuinely NEW campaign with
+    # $0 paid is left untouched (fail-open on newness). Inputs: budget_paid/total (reliably
+    # scraped) + the inline submissions/participants count (extract.parse_activity_count) +
+    # days_active. NOTE: true launch date is NOT on the Whop page, so days_active is Scout's own
+    # tracking age (a LOWER BOUND, 0 on first sight) — it can only EXONERATE a young campaign;
+    # when age is unmeasured the submission count is the evidence the campaign is established.
+    payout_health_enabled: bool = True
+    payout_dead_penalty: float = 0.2         # composite × this for a paying-dead trap (~85% off)
+    payout_min_age_days: float = 10.0        # under this TRACKED age, $0 paid is just "new" (no penalty)
+    payout_min_submissions: int = 10         # need at least this many submissions to judge as dead
+    payout_zero_dollars: float = 1.0         # paid <= $this counts as ~$0 (near-zero payout)
+    payout_zero_fraction: float = 0.005      # OR spent fraction <= this counts as ~$0
+    payout_healthy_spent_fraction: float = 0.02   # >= this of budget paid (with activity) = healthy
+    payout_healthy_boost: float = 1.0        # factor for a healthy paying campaign (1.0 = untouched; >1.0 = boost)
+
     # Footage LINK-LIVENESS derank (liveness.py). A campaign whose footage links are all
     # DEAD/OFFLINE (removed video, empty/locked Drive folder, stream channel with no VODs)
     # is a waste of the clipper's time, so its composite is multiplied by this — a HEAVY
@@ -173,6 +191,15 @@ class Config:
     liveness_cache_path: str = "liveness_cache.json"   # per-link verdict cache (dedupe + TTL)
     liveness_cache_max_age_days: int = 7               # reuse a live/dead link verdict this long
     liveness_probe_spacing: tuple = (1.0, 3.0)         # random sleep between FRESH probes (gentle)
+
+    # footage-PRESENCE derank — distinct from liveness (is an existing link alive) and
+    # accessibility (did the link respond): this asks whether the campaign exposes a PUBLIC,
+    # downloadable footage link AT ALL (Drive folder / VOD or video URL / direct file). A
+    # campaign whose footage is member-gated or absent (ZERO public footage links) can't be
+    # clipped from the auto-run, so it's HEAVY-deranked (composite × no_footage_penalty), never
+    # hard-excluded (a missed link shouldn't permanently kill it). FAILS OPEN: if the detail
+    # section was never loaded (unscraped stub), footage presence is undeterminable -> no penalty.
+    no_footage_penalty: float = 0.15
 
     # output paths
     state_path: str = "state.json"
@@ -419,6 +446,35 @@ def _manual_login_prompt():
     input("Press Enter once logged in... ")
 
 
+def _page_is_live(page):
+    """True if the Playwright page is still open (not closed/detached)."""
+    try:
+        return page is not None and not page.is_closed()
+    except Exception:
+        return False
+
+
+def _reacquire_page(session):
+    """Adopt the live Whop page as session.page after manual login.
+
+    The OAuth redirect chain can close or replace the tab we opened before the
+    prompt, so the original session.page may be dead by the time the user presses
+    Enter. Find the best currently-open page (Whop over a Google-login popup) and
+    make it the page every downstream phase drives. If every tab was closed, open a
+    fresh one so the run can still continue instead of crashing on a closed target.
+    """
+    live = session.live_page()
+    if live is not None:
+        if live is not session.page:
+            print(f"    (re-acquired the active page after login: {live.url})")
+        session.page = live
+        return live
+    print("    (all tabs were closed during login; opening a fresh Whop tab)")
+    session.page = session.context.new_page()
+    safe_goto(session.page, "https://whop.com/")
+    return session.page
+
+
 def _reach_list_or_wait(page, pacer):
     """Get to the Content Rewards list after login by clicking through /discover/.
     Retry a few times; if it still isn't reachable, show what we see and wait for
@@ -450,6 +506,9 @@ def ensure_logged_in(session, first_run, pacer, always_prompt=False):
         # the user has finished logging in and pressed Enter.
         safe_goto(page, "https://whop.com/")
         _manual_login_prompt()
+        # OAuth may have closed/replaced/duplicated the tab — re-acquire the live
+        # Whop page before touching it, or _reach_list_or_wait drives a dead page.
+        page = _reacquire_page(session)
         _reach_list_or_wait(page, pacer)
         return
 
@@ -460,6 +519,7 @@ def ensure_logged_in(session, first_run, pacer, always_prompt=False):
     if not extract.is_login_wall(page) and _on_content_rewards(page):
         return
     _manual_login_prompt()
+    page = _reacquire_page(session)
     _reach_list_or_wait(page, pacer)
 
 
@@ -573,6 +633,21 @@ def _probe_detail(page, pacer, card, list_frame):
 # --- phase 1: list pass --------------------------------------------------------
 def collect_cards(page, pacer, cfg, deadline_ts):
     print("Phase 1 — scanning the Content Rewards list (human scroll)...")
+    # Guard the login->scrape handoff: the page we're about to scroll/scrape must be
+    # open and actually on Whop. If OAuth closed the tab, or we're still parked on a
+    # Google login URL, fail loud here rather than crashing deep inside mouse.wheel
+    # ("Target ... has been closed") in wait_for_feed.
+    if not _page_is_live(page):
+        raise StopRun("the browser page was closed during login — couldn't find a "
+                      "logged-in Whop discover page. Are you fully logged in?")
+    if not _on_content_rewards(page):
+        # One more attempt to reach the list from wherever login left us.
+        navigate_to_list(page, pacer)
+        time.sleep(1.0)
+    if not _page_is_live(page) or extract.is_login_wall(page) or not _on_content_rewards(page):
+        raise StopRun("couldn't find a logged-in Whop Content Rewards page to scrape "
+                      f"(at {page.url if _page_is_live(page) else 'a closed tab'}) — "
+                      "are you fully logged in?")
     if extract.is_challenge(page):
         raise StopRun("challenge on the list page")
     # Cards render inside the app iframe; wait_for_feed returns that FrameLocator.
@@ -658,6 +733,10 @@ _ANALYSIS_DEFAULTS = {
     "join_cta": None, "open_to_all": "unclear",
     "disqualifiers": [], "disqualified": False,
     "first_seen_at": None, "days_active": None, "payout_velocity": None,
+    # PAYOUT HEALTH — is the campaign actually paying? submissions is the inline activity count
+    # next to the budget; payout_health is the verdict (dead/healthy/new/ok/unknown) + the
+    # resolved factor composite_score multiplies in. Fails open (unknown -> factor 1.0).
+    "submissions": None, "payout_health": None, "payout_health_factor": 1.0,
     "snapshot": None, "snapshot_history": None, "trends": None,
     # cross-run + strategic signals (filled by strategic.compute_strategic_signals)
     "budget_drain": None, "participant_growth": None, "source_saturation": None,
@@ -859,6 +938,17 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["language"] = lang
     rec["language_penalty_factor"] = cfg.nonenglish_penalty if lang.get("nonenglish") else 1.0
 
+    # FOOTAGE PRESENCE — does the campaign expose a PUBLIC, downloadable footage link at all?
+    # A fully-scraped campaign with ZERO public footage links (footage member-gated or absent,
+    # e.g. Jesser x ClipFarm / SomSleep) can't be clipped from the auto-run, so it's DERANKED
+    # (not excluded). DISTINCT from the liveness derank (an existing link gone dead). Fails OPEN:
+    # an unscraped stub -> undeterminable -> no penalty. The resolved factor is stored so
+    # composite_score just multiplies it (has-footage/undeterminable -> 1.0, unchanged).
+    fpres = intake_mod.footage_presence(rec)
+    rec["footage_presence"] = fpres
+    rec["footage_presence_factor"] = (cfg.no_footage_penalty
+                                      if fpres.get("has_public_footage") is False else 1.0)
+
     # campaign age (first_seen carried across runs) + payout velocity
     first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \
         or now.isoformat()
@@ -870,6 +960,31 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
         rec["days_active"] = None
     rec["payout_velocity"] = extract.payout_velocity(
         rec.get("budget_paid"), rec.get("budget_total"), rec.get("days_active"))
+
+    # PAYOUT HEALTH — is the campaign ACTUALLY paying, or a paying-dead trap (meaningful
+    # submissions but ~$0 ever paid out)? `submissions` is the inline activity count Whop shows
+    # next to the budget (the live Views/Submissions chart is shadow-DOM and unscraped). days_
+    # active is Scout's own tracking age (lower bound), so it only exonerates a young campaign;
+    # when age is unmeasured the submission count establishes it. Fails open (unknown -> 1.0).
+    rec["submissions"] = extract.parse_activity_count(rec.get("modal_requirements_text"))
+    if cfg.payout_health_enabled:
+        ph = scoring.payout_health(
+            rec.get("budget_paid"), rec.get("budget_total"),
+            rec.get("submissions"), rec.get("days_active"),
+            min_age_days=cfg.payout_min_age_days,
+            min_submissions=cfg.payout_min_submissions,
+            zero_dollars=cfg.payout_zero_dollars,
+            zero_fraction=cfg.payout_zero_fraction,
+            healthy_spent_fraction=cfg.payout_healthy_spent_fraction,
+            dead_penalty=cfg.payout_dead_penalty,
+            healthy_boost=cfg.payout_healthy_boost,
+        )
+    else:
+        ph = {"status": "disabled", "factor": 1.0, "submissions": rec.get("submissions"),
+              "days_open": rec.get("days_active"), "paid_out": rec.get("budget_paid"),
+              "spent_fraction": None, "reason": "payout-health check disabled"}
+    rec["payout_health"] = ph
+    rec["payout_health_factor"] = ph["factor"]
 
     # cross-run snapshot + accumulating history (built on, not replacing, prior runs) +
     # trend. The history is what the budget-drain / participant-growth projections use.

@@ -178,6 +178,37 @@ def min_views_to_payout(min_payout, pay_per_1k):
     return (min_payout / pay_per_1k) * 1000.0
 
 
+# --- activity count (submissions / participants) -------------------------------
+# The live Views/Submissions CHART is a shadow-DOM <number-flow-react> component and is
+# NOT scraped (see selectors.py). But Whop also renders a single standalone activity count
+# inline with the budget on the card/modal — the integer immediately after the "$paid/$total"
+# budget pair. This is the only submissions/participants count available in the modal TEXT,
+# and it's what the payout-health signal needs (meaningful activity + $0 paid = a paying-dead
+# trap). Newline-anchored so it never grabs a pay rate / dollar figure elsewhere in the text.
+_ACTIVITY_AFTER_BUDGET_RE = re.compile(
+    r"\$\s*[0-9][0-9,]*(?:\.[0-9]+)?\s*/\s*\$\s*[0-9][0-9,]*(?:\.[0-9]+)?"
+    r"\s*[\r\n]+\s*([0-9][0-9,]*)\b")
+_ACTIVITY_MAX = 10_000_000     # sanity ceiling; a larger match is almost certainly not a count
+
+
+def parse_activity_count(modal_text):
+    """The activity count Whop shows inline with the budget — the standalone integer right
+    after the '$paid/$total' budget pair in the modal text (submissions / participants). Returns
+    an int, or None when the pattern isn't present (never guessed). This is a PROXY for
+    submissions: the real Views/Submissions chart is shadow-DOM and unscraped, so this single
+    inline count is the payout-health activity signal. Pure/testable."""
+    if not modal_text:
+        return None
+    m = _ACTIVITY_AFTER_BUDGET_RE.search(modal_text)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n <= _ACTIVITY_MAX else None
+
+
 # --- minimum-VIEW payout threshold ---------------------------------------------
 # DISTINCT from the minimum-payout-DOLLAR above: some campaigns pay NOTHING until a single
 # video crosses a hard VIEW count — "VIDEO MUST REACH 10K FOR PAYOUT" (TraxNYC), "minimum

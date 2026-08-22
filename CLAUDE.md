@@ -50,15 +50,15 @@ There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 (`parse_pay`, `parse_money`, `parse_remaining_fraction`, `parse_platforms`,
 `parse_int`, `campaign_id_from_url`, `parse_min_payout`, `min_views_to_payout`,
 `parse_min_view_threshold`, `references_resource_doc`, `extract_handles`, `parse_max_payout`,
-`participants_per_1k_budget`, `payout_velocity`,
+`participants_per_1k_budget`, `payout_velocity`, `parse_activity_count`,
 `detect_disqualifiers`, `classify_openness`, `classify_category`, `classify_categories`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
 (`pre_score`, `clippability`, `composite_score`, `pay_rate_factor`, `reach_factor`,
 `expected_earnings`, `earnings_factor`, `core_signals_known`, `data_confidence_factor`,
 `openness_factor`, `repeatable_factor`, `max_payout_factor`, `min_view_threshold_factor`,
-`velocity_factor`/`_band`,
+`payout_health`/`payout_health_factor`, `velocity_factor`/`_band`,
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
-`action_density_factor`, `footage_access_factor`, `style_fit`, `rank_categories`,
+`action_density_factor`, `footage_access_factor`, `footage_presence_factor`, `style_fit`, `rank_categories`,
 `project_budget_drain`,
 `participant_growth`, `source_saturation_estimate`, `account_reusability`, `rank_categories`,
 and their `*_factor` companions) and `social.parse_count` are likewise pure. `categorize.py`'s
@@ -70,7 +70,7 @@ signal/hash/prompt/parse/validate layer (`campaign_signals`, `content_hash`, `bu
 decision layer (`campaign_liveness`, `classify_link_verdict`, `_normalize_channel_videos_url`)
 is pure/testable with no network — feed it plain verdict dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
 `classify_content_type`, `analyze_transcript_density`, `aggregate_access`,
-`footage_volume`) — test the substance logic with no network. So is the analysis layer of `proven_clips.py` (`clip_performance`,
+`footage_volume`, `footage_presence`) — test the substance logic with no network. So is the analysis layer of `proven_clips.py` (`clip_performance`,
 `aggregate_clippability`, `score_candidate`, `filter_clips`, `analyze_text_patterns`,
 `analyze_lengths`, `analyze_cadence`, `extract_template`, `median`, `percentile`) — no
 yt-dlp/network needed to test the legitimacy/consistency/template math.
@@ -165,6 +165,34 @@ misread as gates), and the penalty scales hard with the threshold — ~0.6× at 
 (SEVERE) at 10K, ~0.04× at 50K+ — because a zero-audience start rarely clears it. Shown as a
 `MIN-VIEW-THRESHOLD` flag in the report. Unlike `below_min_penalty` it needs no proven-clipper
 data, so it fires as soon as the threshold is detected. UNKNOWN/no-gate → neutral 1.0.
+
+**Payout-health derank (`scoring.payout_health` + `cfg.payout_dead_penalty`, default 0.2).**
+Everything above scores POTENTIAL (budget/CPM/reach); this asks whether a campaign is ACTUALLY
+paying, or a **paying-dead trap** — open a while, meaningful submissions, yet ~$0 EVER paid out
+(the "SomSleep" case: 12+ submissions, $0 of $1,750, and it was ranking #3 on pure potential).
+Such a campaign has its composite multiplied by `cfg.payout_dead_penalty` — a HEAVY derank
+(~80% off), NOT a hard exclude. The core judgment: "given how long it's been open and how many
+submissions it has, is ~$0 payout suspicious? Old + many submissions + nothing paid = trap;
+new + nothing paid = fine." Inputs are **budget_paid/total** (reliably scraped) + **submissions**
+(`extract.parse_activity_count` — the inline activity count Whop renders next to the budget in
+the modal text; the live Views/Submissions CHART is shadow-DOM and stays unscraped) + **days_
+active**. CRUCIAL data limitation: the true campaign LAUNCH DATE is NOT on the Whop page, so
+`days_active` is Scout's OWN tracking age — a LOWER BOUND that is 0 on the run a campaign is first
+seen. So age can only EXONERATE (a positive-but-short tracking age proves Scout has watched it a
+short time → $0 is just newness), never condemn; when age is unmeasured (0/first-sight) the
+SUBMISSION count is the evidence the campaign is established — that is what catches a
+just-discovered dead campaign like SomSleep at `days_active=0`. Verdict + factor are resolved in
+`enrich_active` and stored (`rec["submissions"]`, `rec["payout_health"]` = dead/healthy/new/ok/
+unknown + numbers, `rec["payout_health_factor"]`); `composite_score` multiplies the factor in via
+`scoring.payout_health_factor`. **FAILS OPEN everywhere** (unknown budget or unknown submissions,
+few submissions, or a genuinely-young campaign → neutral 1.0, EXACTLY unchanged); a clearly
+healthy paying campaign is untouched (default boost 1.0) or can be nudged up via
+`cfg.payout_healthy_boost`. Tunable knobs: `payout_min_age_days` (10), `payout_min_submissions`
+(10), `payout_zero_dollars` (1.0) / `payout_zero_fraction` (0.005) define "~$0 paid",
+`payout_healthy_spent_fraction` (0.02), `payout_dead_penalty` (0.2), `payout_healthy_boost` (1.0),
+`payout_health_enabled`. Surfaced per campaign in `campaigns_summary.md` (a "Payout:" line —
+e.g. "12 subs / 0d / \$0 paid → DEAD-PAYOUT ×0.2" — and a `DEAD-PAYOUT` flag) and counted in the
+terminal report.
 
 **Data-confidence factor (`data_confidence_factor` × `core_signals_known`).** Because every
 UNKNOWN maps to a neutral 1.0, a campaign with NO real data could float to the top on nothing
@@ -271,7 +299,10 @@ viability, `max_payout_per_video`/`uncapped`, `participants_per_1k_budget`, `cat
 `disqualifiers` (`extract.detect_disqualifiers` — gambling/face-or-voice/min-followers/geo/
 non-clippable-format/paid-ad-spend/non-English/gated-footage/**application-gated**),
 `first_seen_at`+`days_active`+`payout_velocity`, `min_view_threshold`
-(`extract.parse_min_view_threshold`), the `style_fit` inputs, and the per-run `snapshot` +
+(`extract.parse_min_view_threshold`), `submissions`+`payout_health`(+`_factor`) (the
+paying-dead-trap derank — see "Payout-health derank" above), `footage_presence`(+`_factor`) (the
+no-public-footage derank — see "No-public-footage derank" above), the `style_fit` inputs, and the
+per-run `snapshot` +
 cross-run `trends` (`scoring.compute_trends` vs `prev_rec.snapshot`: accelerating/steady/
 stalling/dead, off budget-paid + participant deltas). It also runs the **resource-capture
 cross-check**: when the modal text references a linked Doc/Drive/Notion/folder
@@ -317,6 +348,30 @@ after intake (off-Whop — hits YouTube/Kick, not Whop — so it lives in the un
 the resolved `rec["liveness_penalty_factor"]`, which `composite_score` multiplies via
 `scoring.liveness_factor`. Surfaced per campaign in `campaigns_summary.md` (a "Footage liveness:" line
 + a `DEAD-FOOTAGE` flag). Also a standalone CLI: `python liveness.py <source_url> ...`.
+
+**No-public-footage derank (`intake.footage_presence` + `cfg.no_footage_penalty`, default 0.15).**
+Proven over multiple overnight runs: the highest-ranked campaigns (Jesser x ClipFarm, SomSleep, Call
+of Duty) had NO public footage link — footage is member-gated behind JOINING the campaign — so intake
+can't download anything and the auto-run wasted its walk on them. This signal asks whether a
+campaign exposes a PUBLIC, downloadable footage link (Drive folder / VOD or video URL / direct file)
+AT ALL. It is DISTINCT from BOTH other footage checks: intake's *accessibility* ("did an existing
+link respond?") and liveness's *link-liveness* ("does an existing link resolve to watchable
+content?") both judge links that EXIST; this judges whether ANY public footage link exists in the
+first place. A campaign with zero footage links → THIS penalty; a campaign whose link is dead →
+liveness penalty; both mean "can't clip", for different reasons. A fully-scraped campaign exposing
+ZERO public footage links has its composite multiplied by `cfg.no_footage_penalty` — a HEAVY derank
+(~85% off), NOT a hard exclude (a silently-missed link shouldn't permanently kill a campaign,
+consistent with the liveness derank). **FAILS OPEN**: footage presence is judged only from
+`source_links` (the footage-only field — `docs.google.com`/other doc anchors in `resource_links`
+don't count) filtered to real footage kinds (`intake.FOOTAGE_KINDS`), and when the detail section was
+never loaded (an unscraped card-only stub, no `scraped_at`) presence is UNDETERMINABLE → `None` → no
+penalty (assume it might have footage rather than wrongly bury it). Only an affirmative
+zero-footage-on-a-scraped-campaign is penalized. Pure/testable (`intake.footage_presence`, no
+network). Resolved in `enrich_active` (stores `rec["footage_presence"]` = `has_public_footage`
+true/false/None + link counts, and the resolved `rec["footage_presence_factor"]`), which
+`composite_score` multiplies via `scoring.footage_presence_factor`. Surfaced per campaign in
+`campaigns_summary.md` (a "Footage:" line — `0 public links → NO-FOOTAGE ×0.15` vs `2 public links` —
+and a `NO-FOOTAGE` flag) and counted in the terminal report.
 
 **Application/selection gate (`open_to_all` + the `application_gated` disqualifier).** A
 campaign that isn't an instant open join — you must apply, be accepted/approved, get invited,
@@ -369,8 +424,10 @@ Key module responsibilities:
   `intake.py`/`analyze.py`/`download.py`). Accessibility + content-type + volume/refresh +
   action-density, metadata-only, HTTP-first (yt-dlp optional), cached per campaign,
   never-raise. `probe_campaigns` runs before the social/footage/clipper passes and can add
-  the `footage_inaccessible` disqualifier. See the "Footage SUBSTANCE" note above. Also a
-  standalone CLI: `python intake.py <source_url> ...`.
+  the `footage_inaccessible` disqualifier. See the "Footage SUBSTANCE" note above. Also hosts the
+  pure `footage_presence` helper (no network) behind the no-public-footage derank — "does a public,
+  downloadable footage link EXIST at all?", distinct from accessibility/liveness; see the
+  "No-public-footage derank" note above. Also a standalone CLI: `python intake.py <source_url> ...`.
 - **`categorize.py`** — Groq campaign categorizer (see the "Categorization" note above). Mirrors
   the sibling clipper's Groq client (SDK + rate-limit backoff) on `llama-3.3-70b-versatile` and
   hardened for the free-tier DAILY budget (cache always kept, per-run cap on new campaigns,

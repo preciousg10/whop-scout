@@ -104,6 +104,42 @@ def classify_source(url):
     return "other"
 
 
+# Source kinds that are a PUBLIC, downloadable footage source (Drive folder/file, a VOD or
+# video/channel URL, a live-stream channel, or a direct media file). gdoc/other are NOT
+# footage — a rules doc or an unclassifiable link is not something you can clip.
+FOOTAGE_KINDS = frozenset({"drive_folder", "drive_file", "youtube_video", "youtube_channel",
+                           "twitch", "kick", "direct_file"})
+
+
+def footage_presence(rec):
+    """Does this campaign expose a PUBLIC, downloadable footage link AT ALL?
+
+    DISTINCT from liveness (is an EXISTING link alive/dead) and accessibility (did the link
+    respond) — this asks only whether a public footage link EXISTS. It catches the top-of-board
+    trap where the footage is member-gated behind joining the campaign (Jesser x ClipFarm,
+    SomSleep): intake can't download anything, so the auto-run wastes its walk on them.
+
+    Returns {has_public_footage: True|False|None, footage_link_count, total_link_count,
+    determinable, reason}. FAILS OPEN: if the detail section was never loaded (an unscraped
+    card-only stub, no `scraped_at`), footage presence is UNDETERMINABLE -> None (no penalty —
+    assume it might have footage rather than wrongly bury it). Only a fully-scraped campaign
+    with ZERO public footage links is False (the derank case)."""
+    links = [u for u in (rec.get("source_links") or []) if u]
+    footage = [u for u in links if classify_source(u) in FOOTAGE_KINDS]
+    n = len(footage)
+    if n > 0:
+        return {"has_public_footage": True, "footage_link_count": n,
+                "total_link_count": len(links), "determinable": True,
+                "reason": f"{n} public footage link(s)"}
+    if not rec.get("scraped_at"):
+        return {"has_public_footage": None, "footage_link_count": 0,
+                "total_link_count": len(links), "determinable": False,
+                "reason": "detail not loaded — footage presence undeterminable (fail-open)"}
+    return {"has_public_footage": False, "footage_link_count": 0,
+            "total_link_count": len(links), "determinable": True,
+            "reason": "no public footage link — footage member-gated or absent"}
+
+
 # --- content type from the brief text ------------------------------------------
 _CT_UGC = re.compile(
     r"\b(face\s+on\s+camera|on[-\s]camera|show\s+your\s+face|film\s+yourself|"

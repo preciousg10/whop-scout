@@ -54,10 +54,18 @@ class Pacer:
         time.sleep(secs)
 
     def human_scroll(self, page, steps=None):
-        """Incremental wheel scrolls. Never jumps to bottom."""
+        """Incremental wheel scrolls. Never jumps to bottom.
+
+        A wheel on a closed/detached page raises TargetClosedError; that must not be
+        the thing that crashes a run (the login->scrape handoff guard reports the
+        real problem). If the page has gone away mid-scroll, stop quietly.
+        """
         steps = steps if steps is not None else random.randint(2, 5)
         for _ in range(steps):
-            page.mouse.wheel(0, random.randint(*self.scroll_step))
+            try:
+                page.mouse.wheel(0, random.randint(*self.scroll_step))
+            except Exception:
+                return
             time.sleep(random.uniform(*self.scroll_pause))
 
     def maybe_hover(self, locator):

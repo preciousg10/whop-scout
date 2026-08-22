@@ -39,6 +39,41 @@ class Session:
         )
         return self
 
+    def live_page(self):
+        """Re-acquire a currently-open page from the context, preferring a Whop tab.
+
+        Manual login (especially Google OAuth) can close, replace, or duplicate the
+        tab we started with: a full-page OAuth redirect can leave the original tab
+        stale, a popup-based sign-in adds an accounts.google.com page, and the user
+        may open a fresh tab themselves. After login we must NOT keep driving a
+        closed Page (that's the `Target ... has been closed` crash at mouse.wheel).
+        This returns the best live page — a real Whop page over a Google-login popup
+        over a blank tab — or None if every tab was closed.
+        """
+        pages = []
+        for p in self.context.pages:
+            try:
+                if not p.is_closed():
+                    pages.append(p)
+            except Exception:
+                continue
+        if not pages:
+            return None
+
+        def rank(p):
+            url = (p.url or "").lower()
+            # A Google/OAuth login popup is the LAST thing we want to scrape.
+            if "accounts.google" in url or "/oauth" in url or "signin" in url:
+                return 0
+            if "whop.com" in url:
+                return 3
+            if url and url != "about:blank":
+                return 2
+            return 1
+
+        pages.sort(key=rank, reverse=True)
+        return pages[0]
+
     def __exit__(self, *_exc):
         try:
             if self.context:

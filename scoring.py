@@ -320,11 +320,112 @@ def liveness_factor(liveness_penalty_factor):
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
+def footage_presence_factor(footage_presence_penalty_factor):
+    """No-public-footage derank. The resolved factor is computed upstream (enrich_active sets
+    rec['footage_presence_factor'] = cfg.no_footage_penalty when a FULLY-SCRAPED campaign
+    exposes ZERO public footage links, else 1.0), so this just validates it: a positive number
+    is used as-is, anything else -> neutral 1.0 (fail-open — a campaign WITH footage, or one
+    whose footage presence is undeterminable, is left EXACTLY unchanged). SEPARATE from
+    liveness_factor: this fires when NO public link exists, liveness when an existing link is
+    dead. Both mean 'can't clip', for different reasons."""
+    f = footage_presence_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
 def openness_factor(open_to_all):
     """Weight campaigns open to an instant free join UP (the pipeline needs to start clipping
     immediately). 'yes' -> 1.1 (a plus), 'unclear' -> 1.0 (neutral — never guessed), 'no' ->
     0.5 (moot: application-gated is a hard disqualifier that already forces composite 0)."""
     return {"yes": 1.1, "no": 0.5}.get(open_to_all, 1.0)
+
+
+# --- payout health (is the campaign ACTUALLY paying?) --------------------------
+def payout_health(paid, total, submissions, days_active, *,
+                  min_age_days=10.0, min_submissions=10,
+                  zero_dollars=1.0, zero_fraction=0.005,
+                  healthy_spent_fraction=0.02,
+                  dead_penalty=0.2, healthy_boost=1.0):
+    """Judge whether a campaign is a PAYING-DEAD trap: lots of activity but ~$0 ever paid out.
+
+    Scout scores potential (budget/CPM/reach) but is otherwise blind to whether a campaign
+    actually pays. The core judgment (the user's words): "given how long it's been open and how
+    many submissions it has, is ~$0 payout suspicious? Old + many submissions + nothing paid =
+    trap; new + nothing paid = fine."
+
+    Data reality (STEP 0): `total`/`paid` are reliably scraped; `submissions` is the inline
+    activity count Whop shows next to the budget (extract.parse_activity_count); TRUE launch
+    date is NOT on the page, so `days_active` is Scout's own tracking age — a LOWER BOUND that
+    is 0 on the run a campaign is first seen. So age can only EXONERATE (a positive-but-young
+    tracking age proves Scout has watched it a short time), never condemn: when age is
+    unmeasured (0/None, first sight) the SUBMISSION count is the evidence the campaign is
+    established — that's what catches a just-discovered dead campaign like SomSleep.
+
+    Returns a dict {status, factor, paid_out, spent_fraction, submissions, days_open, reason}:
+      - status 'dead'    -> factor `dead_penalty` (heavy derank; NOT an exclude)
+      - status 'healthy' -> factor `healthy_boost` (default 1.0 = untouched; >1.0 = small boost)
+      - status 'new'/'ok'/'unknown' -> factor 1.0 (fail-open — never penalize on doubt)
+
+    Fail-open everywhere: unknown budget or unknown submissions -> neutral 1.0. Pure/testable."""
+    out = {"status": "unknown", "factor": 1.0, "paid_out": paid, "spent_fraction": None,
+           "submissions": submissions, "days_open": days_active, "reason": ""}
+
+    def num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    if not num(paid) or not num(total) or total <= 0:
+        out["reason"] = "budget unknown — not judged"
+        return out
+    spent_frac = paid / total
+    out["spent_fraction"] = round(spent_frac, 6)
+    near_zero = paid <= zero_dollars or spent_frac <= zero_fraction
+
+    if not num(submissions):
+        out["reason"] = "submission count unknown — not judged"
+        return out
+    if submissions < min_submissions:
+        out["status"] = "new"
+        out["reason"] = (f"only {int(submissions)} submissions (<{min_submissions}) — "
+                         f"too little activity to judge")
+        return out
+
+    # age can only EXONERATE: a positive-but-short tracking age means Scout has genuinely
+    # watched this a short time, so ~$0 is just newness. Age unmeasured (0/None, first sight)
+    # does NOT exonerate — the submission count already established it's active.
+    measured_young = num(days_active) and 0 < days_active < min_age_days
+
+    if near_zero:
+        if measured_young:
+            out["status"] = "new"
+            out["reason"] = (f"{int(submissions)} submissions but only ~{days_active:.0f}d "
+                             f"tracked (<{min_age_days:.0f}d) — $0 payout not yet suspicious")
+            return out
+        out["status"] = "dead"
+        out["factor"] = dead_penalty
+        age_txt = (f"{days_active:.0f}d+ tracked" if num(days_active) and days_active > 0
+                   else "since first seen")
+        out["reason"] = (f"{int(submissions)} submissions / {age_txt} but ~$0 paid "
+                         f"(${paid:,.2f} of ${total:,.0f}) — not paying out")
+        return out
+
+    if spent_frac >= healthy_spent_fraction:
+        out["status"] = "healthy"
+        out["factor"] = healthy_boost
+        out["reason"] = (f"paying — ${paid:,.0f} ({spent_frac * 100:.0f}% of budget) across "
+                         f"{int(submissions)} submissions")
+        return out
+
+    out["status"] = "ok"
+    out["reason"] = f"some payout (${paid:,.0f}, {spent_frac * 100:.1f}% of budget)"
+    return out
+
+
+def payout_health_factor(payout_health_penalty_factor):
+    """Payout-health derank. The resolved factor is computed upstream (enrich_active sets
+    rec['payout_health_factor'] = cfg.payout_dead_penalty for a paying-dead trap, the healthy
+    boost, or 1.0), so this just validates it: a positive number is used as-is, anything else ->
+    neutral 1.0 (fail-open — an unknown/new/healthy campaign is left EXACTLY unchanged)."""
+    f = payout_health_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
 # --- max payout per video ------------------------------------------------------
@@ -860,6 +961,19 @@ def composite_score(c):
     live = c.get("liveness") or {}
     live_fac = liveness_factor(c.get("liveness_penalty_factor"))
 
+    # no-public-footage derank — heavy penalty when a FULLY-SCRAPED campaign exposes ZERO
+    # public footage links (footage member-gated or absent, so intake can't download anything).
+    # SEPARATE from liveness (dead existing link). Resolved upstream in enrich_active from
+    # cfg.no_footage_penalty; has-footage / undeterminable -> 1.0 (fail-open), unchanged.
+    fpres = c.get("footage_presence") or {}
+    fpres_fac = footage_presence_factor(c.get("footage_presence_factor"))
+
+    # payout-health derank — is the campaign ACTUALLY paying? A paying-dead trap (meaningful
+    # submissions but ~$0 ever paid out) is heavy-deranked; a genuinely new campaign with $0
+    # paid is left untouched (fail-open). Factor resolved upstream in enrich_active.
+    payout = c.get("payout_health") or {}
+    payout_fac = payout_health_factor(c.get("payout_health_factor"))
+
     disqualified = bool(c.get("disqualifiers"))
 
     # Base is driven by ABSOLUTE budget dollars (not bare %) and REACH (primary), only nudged
@@ -871,7 +985,7 @@ def composite_score(c):
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
-        * dc_fac * open_fac * lang_fac * live_fac, 6)
+        * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -965,6 +1079,17 @@ def composite_score(c):
         "liveness_status": live.get("status"),
         "liveness_penalized": bool(live.get("penalized")),
         "liveness_factor": live_fac,
+        # no-public-footage — heavy derank when zero public footage links (fail-open)
+        "has_public_footage": fpres.get("has_public_footage"),
+        "footage_link_count": fpres.get("footage_link_count"),
+        "footage_presence_factor": fpres_fac,
+        # payout health — is the campaign actually paying? (dead/healthy/new/ok/unknown)
+        "payout_status": payout.get("status"),
+        "payout_submissions": payout.get("submissions"),
+        "payout_days_open": payout.get("days_open"),
+        "payout_paid_out": payout.get("paid_out"),
+        "payout_spent_fraction": payout.get("spent_fraction"),
+        "payout_factor": payout_fac,
         "disqualified": disqualified,
         "composite": composite,
     }
