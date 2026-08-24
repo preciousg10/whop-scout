@@ -210,6 +210,17 @@ class Config:
     approval_rate_floor: float = 65.0        # known approval rate below this -> derank
     approval_low_penalty: float = 0.2        # composite × this when approval < floor (~80% off)
 
+    # SELF-SOURCED footage derank — some campaigns PROVIDE no footage; their rules/docs tell
+    # clippers to find their OWN ("find your own footage", "use any footage of X", "we don't
+    # provide footage"). Un-clippable by a footage-download pipeline, so HEAVY-deranked (composite
+    # × self_sourced_penalty), NOT excluded. The instruction usually lives in the rules DOC, so
+    # (when self_sourced_fetch_docs) Scout fetches the Google-Doc rules text for footage-less
+    # gdoc campaigns and re-checks. FAILS OPEN: detection is high-precision, so a normal campaign
+    # is never flagged; unfetched/ambiguous -> not flagged.
+    self_sourced_enabled: bool = True
+    self_sourced_penalty: float = 0.2        # composite × this when self-sourced (~80% off)
+    self_sourced_fetch_docs: bool = True     # fetch gdoc rules text for footage-less campaigns
+
     # output paths
     state_path: str = "state.json"
     campaigns_path: str = "campaigns.json"
@@ -778,6 +789,11 @@ _ANALYSIS_DEFAULTS = {
     # public Notion page's rules.
     "rules_readable": None, "rules_source": None, "rules_unreadable": False,
     "rules_unreadable_reason": None, "notion_rules_text": None,
+    # SELF-SOURCED footage derank (campaign provides no footage; clipper must find their own).
+    # rules_doc_text caches fetched Google-Doc rules text (persists across runs). self_sourced
+    # (True/False/None) + the matched phrase + the resolved factor composite_score multiplies in.
+    "rules_doc_text": None, "self_sourced": None, "self_sourced_phrase": None,
+    "self_sourced_factor": 1.0,
     # Prohibited/vice category exclusion (gambling/betting/casino/alcohol/vape/…). Like
     # rules_unreadable, excluded_prohibited=True REMOVES the campaign from the ranked output
     # the clipper reads (kept in campaigns.json, segregated in the report with the reason);
@@ -974,6 +990,14 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     known_low = (cfg.approval_derank_enabled and isinstance(appr, (int, float))
                  and not isinstance(appr, bool) and appr < cfg.approval_rate_floor)
     rec["approval_rate_factor"] = cfg.approval_low_penalty if known_low else 1.0
+
+    # SELF-SOURCED footage — does the rules text tell clippers to find their OWN footage (campaign
+    # provides none)? Un-clippable by a footage-download pipeline, so DERANKED (not excluded).
+    # Resolved here over the text available now (modal + rules bullets + any Notion text); the
+    # gdoc-doc pass (enrich_self_sourced_docs, after rules-readability) re-checks footage-less
+    # campaigns with the fetched doc text. Fails OPEN — high-precision detector, so a normal
+    # campaign is never flagged. The resolved factor is stored for composite_score to multiply in.
+    resolve_self_sourced(rec, cfg)
 
     # campaign age (first_seen carried across runs) + payout velocity
     first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \
@@ -1490,6 +1514,96 @@ def _fetch_notion_text(url, timeout=20):
     if not text or len(text) < 400 or "enable javascript" in low:
         return None, f"no usable rules text ({len(text)} chars — JS-only/gated/private)"
     return text[:8000], "notion-http"
+
+
+def _gdoc_export_url(url):
+    """The plaintext-export URL for a public Google DOCUMENT, or None (sheets/slides/other are
+    not handled)."""
+    m = re.search(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)", url or "")
+    return f"https://docs.google.com/document/d/{m.group(1)}/export?format=txt" if m else None
+
+
+def _fetch_gdoc_text(url, timeout=20):
+    """Best-effort fetch of a PUBLIC Google Doc's plaintext via the export endpoint. Returns
+    (text, source) on success or (None, reason) on failure. Never raises. Used ONLY to read the
+    rules doc for the self-sourced-footage check (a private doc simply yields no text -> no flag,
+    fail-open)."""
+    exp = _gdoc_export_url(url)
+    if not exp:
+        return None, "not a google-doc url"
+    import urllib.request
+    try:
+        req = urllib.request.Request(exp, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return None, f"fetch failed: {(str(e).splitlines() or ['?'])[0]}"
+    text = " ".join(raw.split())
+    if not text or len(text) < 30:
+        return None, f"empty/unreadable ({len(text)} chars — private/gated)"
+    return text[:8000], "gdoc-export"
+
+
+def _self_sourced_text(rec):
+    """All the rules text available for a record — modal body + rules bullets + any fetched
+    Notion/Google-Doc rules text — joined for the self-sourced-footage check."""
+    return " ".join(t for t in (rec.get("rules_text"), rec.get("modal_requirements_text"),
+                                rec.get("notion_rules_text"), rec.get("rules_doc_text")) if t)
+
+
+def resolve_self_sourced(rec, cfg):
+    """Resolve the SELF-SOURCED footage flag for one record: does the rules text tell clippers to
+    find their OWN footage (campaign provides none)? Sets self_sourced (bool), self_sourced_phrase
+    (the matched text or None), and self_sourced_factor (cfg.self_sourced_penalty when flagged,
+    else 1.0). Pure over the record's already-present text; fails OPEN (high-precision detector)."""
+    if not getattr(cfg, "self_sourced_enabled", True):
+        rec["self_sourced"] = False
+        rec["self_sourced_phrase"] = None
+        rec["self_sourced_factor"] = 1.0
+        return rec
+    phrase = extract.detect_self_sourced(_self_sourced_text(rec))
+    rec["self_sourced"] = bool(phrase)
+    rec["self_sourced_phrase"] = phrase
+    rec["self_sourced_factor"] = cfg.self_sourced_penalty if phrase else 1.0
+    return rec
+
+
+def enrich_self_sourced_docs(records, cfg):
+    """Fetch Google-Doc rules text for FOOTAGE-LESS gdoc campaigns (where self-sourcing is
+    plausible) and re-resolve the self-sourced flag with the doc text. The instruction usually
+    lives in the doc, not the modal, so this is what makes the signal real. Bounded to the
+    footage-less + gdoc-linked set, CACHED via rules_doc_text (persists in campaigns.json, so only
+    the first run pays), off-Whop, best-effort — never raises. Returns (fetched, flagged)."""
+    if not (getattr(cfg, "self_sourced_enabled", True)
+            and getattr(cfg, "self_sourced_fetch_docs", True)):
+        return 0, 0
+    fetched = flagged = 0
+    for rec in records:
+        if rec.get("status") not in ("scraped", "refreshed"):
+            continue
+        if rec.get("self_sourced"):                 # already flagged from stored text
+            flagged += 1
+            continue
+        if not rec.get("rules_doc_text"):
+            # only footage-less campaigns with a gdoc rules link are worth a fetch
+            if (rec.get("footage_presence") or {}).get("has_public_footage") is not False:
+                continue
+            gdocs = _rules_gdoc_links(rec.get("resource_links"))
+            if not gdocs:
+                continue
+            text, _why = _fetch_gdoc_text(gdocs[0].get("url"))
+            if text:
+                rec["rules_doc_text"] = text
+                fetched += 1
+        resolve_self_sourced(rec, cfg)
+        if rec.get("self_sourced"):
+            flagged += 1
+    if fetched or flagged:
+        print(f"  Self-sourced footage: fetched {fetched} rules doc(s); "
+              f"{flagged} campaign(s) flagged self-sourced (deranked ×{cfg.self_sourced_penalty})")
+    return fetched, flagged
 
 
 def resolve_rules_readability(rec, fetch=True):
@@ -2226,6 +2340,11 @@ def main():
             # fetch Notion when it's the ONLY source; campaigns whose rules can't be read are
             # flagged rules_unreadable and excluded from the ranked output (report + clipper).
             resolve_rules_readability_all(results)
+            # SELF-SOURCED footage — fetch the Google-Doc rules text for footage-less gdoc
+            # campaigns and flag any that tell clippers to find their OWN footage (un-clippable by
+            # a footage-download pipeline). Bounded, cached, off-Whop, fail-open. Must run AFTER
+            # footage_presence (set in enrich_active) so the footage-less gate is available.
+            enrich_self_sourced_docs(results, cfg)
             # FOOTAGE SUBSTANCE INTAKE — runs FIRST (accessibility is a hard disqualifier,
             # so an undownloadable-footage campaign is sunk before we spend effort on it).
             # Judges what I'd actually be clipping, not just the stats. Cached per campaign.

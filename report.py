@@ -146,6 +146,12 @@ def _fmt_liveness(c):
 def _fmt_footage_presence(c):
     """Footage-presence summary line: does a PUBLIC downloadable footage link exist at all?
     'Footage: 0 public links -> NO-FOOTAGE x0.15' vs 'Footage: 2 public links'."""
+    if c.get("self_sourced"):
+        fac = (c.get("composite_breakdown") or {}).get("self_sourced_factor")
+        fac_txt = f" → ×{fac}" if fac is not None else ""
+        ph = c.get("self_sourced_phrase")
+        ph_txt = f" [\"{ph}\"]" if ph else ""
+        return f"SELF-SOURCED (no footage provided){fac_txt}{ph_txt}"
     fp = c.get("footage_presence") or {}
     has = fp.get("has_public_footage")
     n = fp.get("footage_link_count")
@@ -238,6 +244,12 @@ def _warning_flags(c):
         fac = b.get("approval_rate_factor")
         fac_txt = f" (composite x{fac})" if fac is not None else ""
         flags.append(f"LOW-APPROVAL ({ar:.0f}% approved){fac_txt}")
+    if c.get("self_sourced"):
+        fac = b.get("self_sourced_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        ph = c.get("self_sourced_phrase")
+        ph_txt = f": \"{ph}\"" if ph else ""
+        flags.append(f"SELF-SOURCED (no footage provided){fac_txt}{ph_txt}")
     return flags
 
 
@@ -603,6 +615,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     low_approval = sum(1 for c in active
                        if ((c.get("composite_breakdown") or {}).get("approval_rate_factor")
                            or 1.0) < 1.0)
+    self_sourced = sum(1 for c in active if c.get("self_sourced"))
     capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
@@ -625,6 +638,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
     print(f"  DEAD-PAYOUT (active but ~$0 paid)    : {dead_payout}")
     print(f"  LOW-APPROVAL (< floor, deranked)     : {low_approval}")
+    print(f"  SELF-SOURCED footage (deranked)      : {self_sourced}")
     print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")

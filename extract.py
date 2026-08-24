@@ -234,6 +234,83 @@ def parse_approval_rate(text):
     return n if 0 <= n <= 100 else None
 
 
+# --- self-sourced footage ------------------------------------------------------
+# Some campaigns PROVIDE no footage — their rules/docs tell clippers to find their OWN
+# ("find your own footage", "source your own clips", "use any footage of <person>",
+# "clip any stream you find", "we don't provide footage"). These are un-clippable by a
+# footage-DOWNLOAD pipeline, so scoring heavily deranks them. Detection is FLEXIBLE about the
+# concept but HIGH-PRECISION (fail-open: a normal campaign must NEVER be flagged), and it
+# LOCALLY SUPPRESSES a match when the surrounding words say footage IS provided (a "source
+# footage library", a "content folder", "more footage is being added" — the BitLife case).
+_SS_MEDIA = (r"(?:footage|clips?|streams?|vods?|videos?|content|highlights?|moments?|"
+             r"material|gameplay)")
+# an explicit "we don't provide footage / footage is not provided" — decisive on its own, and
+# it CONTAINS the word 'provided', so it is checked SEPARATELY (never locally suppressed).
+_SS_NO_PROVIDE = re.compile(
+    r"\bwe\s+(?:do\s*n[o'’]?t|don['’]?t|do\s+not|will\s+not|won['’]?t|cannot|can['’]?t)\s+"
+    r"(?:provide|supply|give|offer)\s+(?:any\s+|the\s+|raw\s+|source\s+)?"
+    r"(?:footage|clips?|content|source\s+material|videos?)\b"
+    r"|\bno\s+(?:raw\s+|source\s+)?(?:footage|clips?|source\s+material|videos?)\s+"
+    r"(?:is\s+|are\s+|will\s+be\s+)?(?:provided|supplied|given|included|available|offered)\b"
+    r"|\b(?:footage|clips?|content|source\s+material|videos?)\s+(?:is|are|will\s+be)\s+not\s+"
+    r"(?:provided|supplied|included|given|available|offered)\b", re.I)
+# the "find/use your own footage" family — genuine self-sourcing. Note 'create/make/edit/post
+# your own clips' means PRODUCING clips (not sourcing footage) and is deliberately NOT matched.
+_SS_PATTERNS = (
+    # "<source-verb> your own [adj/name] <media>" — find/use your own [BitLife] footage/streams
+    r"\b(?:find|sourc(?:e|ing)|gather|collect|pull|grab|obtain|get|use|dig\s+up|scour"
+    r"(?:\s+for)?)\s+your\s+own\s+(?:[A-Za-z][\w'’-]*\s+){0,2}" + _SS_MEDIA + r"\b",
+    # "your own [adj] footage/streams/vods/gameplay" as raw SOURCE material (not 'your own clips')
+    r"\byour\s+own\s+(?:raw\s+|[A-Za-z][\w'’-]*\s+){0,2}"
+    r"(?:footage|streams?|vods?|gameplay|source\s+material)\b",
+    # "<verb> any <media> (of <X> | you find)" — use any footage of X / clip any stream you find.
+    # NOTE: 'from' is deliberately excluded ("use any clip FROM outside this channel" is the
+    # OPPOSITE — provided-footage-only — and negated forms are dropped by the negation guard).
+    r"\b(?:use|clip|find|pull|grab|take|source|download)\s+any\s+" + _SS_MEDIA +
+    r"\s+(?:of|you(?:\s+can)?\s+find)\b",
+    # "any <media> of <X> you (can) find"
+    r"\bany\s+" + _SS_MEDIA + r"\s+of\s+[^.\n]{1,40}?\byou(?:\s+can)?\s+find\b",
+    # "find/source the footage yourself | on your own"
+    r"\b(?:find|sourc(?:e|ing)|gather|locate)\s+(?:the\s+|all\s+)?" + _SS_MEDIA +
+    r"[^.\n]{0,30}?\b(?:yourself|on\s+your\s+own)\b",
+    # "you must find/source/provide the footage"
+    r"\byou(?:['’]ll|\s+will)?\s+(?:must|need\s+to|have\s+to|are\s+expected\s+to|are\s+"
+    r"responsible\s+for)\s+(?:find(?:ing)?|sourc(?:e|ing)|gather(?:ing)?|locat(?:e|ing)|"
+    r"provid(?:e|ing))\s+(?:the\s+|your\s+own\s+|all\s+)?" + _SS_MEDIA + r"\b",
+)
+_SS_RE = [re.compile(p, re.I) for p in _SS_PATTERNS]
+# words near a match that mean footage IS provided here (so the match is NOT self-sourcing)
+_SS_PROVIDED_NEARBY = re.compile(
+    r"\b(?:provided|we\s+provide|is\s+provided|are\s+provided|will\s+be\s+provided|library|"
+    r"folder|below|here|link(?:ed)?|available|supplied|attached|in\s+the\s+(?:doc|drive))\b",
+    re.I)
+# a NEGATION right before the match REVERSES the instruction ("do NOT use any clip from
+# outside...", "you cannot use your own footage") — footage is provided-only, NOT self-sourcing.
+_SS_NEGATION_BEFORE = re.compile(
+    r"\b(?:do\s*n[o'’]?t|don['’]?t|do\s+not|never|cannot|can['’]?t|must\s+not|"
+    r"may\s+not|are\s+not\s+(?:allowed|permitted)|not\s+allowed\s+to)\s+\w*\s*$", re.I)
+
+
+def detect_self_sourced(text):
+    """The matched self-sourced-footage phrase (campaign provides no footage; clipper must find
+    their own), or None when nothing genuine matches. Fail-open by design — high precision: a
+    'find your own' match is dropped when nearby words show footage IS provided, and a NEGATED
+    instruction ('do NOT use any clip from outside this channel') is dropped too. Pure/testable."""
+    if not text:
+        return None
+    m = _SS_NO_PROVIDE.search(text)      # decisive; never locally suppressed
+    if m:
+        return " ".join(m.group(0).split())[:120]
+    for rx in _SS_RE:
+        for m in rx.finditer(text):
+            if _SS_PROVIDED_NEARBY.search(text[max(0, m.start() - 40): m.end() + 40]):
+                continue                 # footage provided nearby — not self-sourcing
+            if _SS_NEGATION_BEFORE.search(text[max(0, m.start() - 24): m.start()]):
+                continue                 # instruction is NEGATED — the opposite of self-sourcing
+            return " ".join(m.group(0).split())[:120]
+    return None
+
+
 # --- minimum-VIEW payout threshold ---------------------------------------------
 # DISTINCT from the minimum-payout-DOLLAR above: some campaigns pay NOTHING until a single
 # video crosses a hard VIEW count — "VIDEO MUST REACH 10K FOR PAYOUT" (TraxNYC), "minimum

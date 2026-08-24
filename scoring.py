@@ -343,6 +343,17 @@ def approval_rate_factor(approval_rate_penalty_factor):
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
+def self_sourced_factor(self_sourced_penalty_factor):
+    """Self-sourced-footage derank. The resolved factor is computed upstream (enrich_active /
+    enrich_self_sourced_docs set rec['self_sourced_factor'] = cfg.self_sourced_penalty when the
+    rules tell clippers to find their OWN footage, else 1.0), so this just validates it: a
+    positive number is used as-is, anything else -> neutral 1.0 (fail-open — a campaign that
+    PROVIDES footage, or whose rules don't clearly demand self-sourcing, is left EXACTLY
+    unchanged). Self-sourced footage is un-clippable by a footage-download pipeline."""
+    f = self_sourced_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
 def openness_factor(open_to_all):
     """Weight campaigns open to an instant free join UP (the pipeline needs to start clipping
     immediately). 'yes' -> 1.1 (a plus), 'unclear' -> 1.0 (neutral — never guessed), 'no' ->
@@ -985,6 +996,11 @@ def composite_score(c):
     appr = c.get("approval_rate")
     appr_fac = approval_rate_factor(c.get("approval_rate_factor"))
 
+    # self-sourced-footage derank — heavy penalty when the rules tell clippers to find their OWN
+    # footage (campaign provides none — un-clippable by a footage-download pipeline). Resolved
+    # upstream from cfg.self_sourced_penalty; provides-footage / ambiguous -> 1.0 (fail-open).
+    ss_fac = self_sourced_factor(c.get("self_sourced_factor"))
+
     # payout-health derank — is the campaign ACTUALLY paying? A paying-dead trap (meaningful
     # submissions but ~$0 ever paid out) is heavy-deranked; a genuinely new campaign with $0
     # paid is left untouched (fail-open). Factor resolved upstream in enrich_active.
@@ -1003,7 +1019,7 @@ def composite_score(c):
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
         * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac
-        * appr_fac, 6)
+        * appr_fac * ss_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -1104,6 +1120,10 @@ def composite_score(c):
         # approval rate — heavy derank when a KNOWN rate is below the floor (fail-open on UNKNOWN)
         "approval_rate": appr,
         "approval_rate_factor": appr_fac,
+        # self-sourced footage — heavy derank when clippers must find their own footage (fail-open)
+        "self_sourced": bool(c.get("self_sourced")),
+        "self_sourced_phrase": c.get("self_sourced_phrase"),
+        "self_sourced_factor": ss_fac,
         # payout health — is the campaign actually paying? (dead/healthy/new/ok/unknown)
         "payout_status": payout.get("status"),
         "payout_submissions": payout.get("submissions"),
