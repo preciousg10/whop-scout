@@ -180,6 +180,18 @@ def _fmt_payout(c):
     return f"{head} → {status} ({ph.get('reason')})"
 
 
+def _fmt_approval(c):
+    """Approval-rate line — ALWAYS shown. The % of submissions a campaign approves/pays:
+    'approval: 88%' / 'approval: 22% → LOW x0.2' / 'approval: UNKNOWN'."""
+    ar = c.get("approval_rate")
+    if not isinstance(ar, (int, float)) or isinstance(ar, bool):
+        return "UNKNOWN (not shown/parsed — fail-open, no penalty)"
+    fac = (c.get("composite_breakdown") or {}).get("approval_rate_factor")
+    if fac is not None and fac < 1.0:
+        return f"{ar:.0f}% → LOW x{fac}"
+    return f"{ar:.0f}%"
+
+
 def _warning_flags(c):
     """Only real warnings — nothing neutral. Disqualifiers live in their own section."""
     b = c.get("composite_breakdown") or {}
@@ -220,6 +232,12 @@ def _warning_flags(c):
         subs = ph.get("submissions")
         subs_txt = f"{int(subs)} subs, " if isinstance(subs, (int, float)) else ""
         flags.append(f"DEAD-PAYOUT ({subs_txt}~$0 paid){fac_txt}")
+    ar = c.get("approval_rate")
+    if isinstance(ar, (int, float)) and not isinstance(ar, bool) \
+            and (b.get("approval_rate_factor") or 1.0) < 1.0:
+        fac = b.get("approval_rate_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        flags.append(f"LOW-APPROVAL ({ar:.0f}% approved){fac_txt}")
     return flags
 
 
@@ -245,6 +263,7 @@ def _campaign_block(c, rank):
     lines.append(f"Footage: {_fmt_footage_presence(c)}")
     lines.append(f"Footage liveness: {_fmt_liveness(c)}")
     lines.append(f"Payout: {_fmt_payout(c)}")
+    lines.append(f"Approval: {_fmt_approval(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
     lines.append(f"Language: {_fmt_language(c)}")
 
@@ -581,6 +600,9 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     noneng = sum(1 for c in active if (c.get("language") or {}).get("nonenglish"))
     min_view_gated = sum(1 for c in active if c.get("min_view_threshold"))
     dead_payout = sum(1 for c in active if (c.get("payout_health") or {}).get("status") == "dead")
+    low_approval = sum(1 for c in active
+                       if ((c.get("composite_breakdown") or {}).get("approval_rate_factor")
+                           or 1.0) < 1.0)
     capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
@@ -602,6 +624,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     print(f"  Non-English (deranked, not excluded) : {noneng}")
     print(f"  Min-VIEW payout gate (penalized)     : {min_view_gated}")
     print(f"  DEAD-PAYOUT (active but ~$0 paid)    : {dead_payout}")
+    print(f"  LOW-APPROVAL (< floor, deranked)     : {low_approval}")
     print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")
@@ -621,7 +644,7 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
             cp = f"{100 * ach / tot:.0f}%" if tot else "n/a"
             print(f"    {label:<34}: {known}/{ach} ({ap})   {ach}/{tot} ({cp})")
         print("")
-    print("  Top 10 by composite (comp | $/clip | clip | data | category):")
+    print("  Top 10 by composite (comp | $/clip | clip | data | appr | category):")
     if not active:
         print("    (none)")
     for i, c in enumerate(active[:10], 1):
@@ -632,9 +655,13 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
         rcs = rc.get("score")
         rep = f"{rcs:.2f}" if rcs is not None else "UNK"
         data = f"{_core_known(c)}/5"
+        ar = c.get("approval_rate")
+        low = ((c.get("composite_breakdown") or {}).get("approval_rate_factor") or 1.0) < 1.0
+        appr_txt = (f"{ar:.0f}%{'!' if low else ''}"
+                    if isinstance(ar, (int, float)) and not isinstance(ar, bool) else "UNK")
         cat = (c.get("category") or "other")[:10]
         print(f"    {i:>2}. {_composite_of(c):7.3f}  {name:<26}  {earn_txt:>6}  "
-              f"{rep:>5}  {data:>4}  {cat}")
+              f"{rep:>5}  {data:>4}  {appr_txt:>5}  {cat}")
     if category_summary:
         cs = category_summary
         srcs = cs.get("sources") or {}

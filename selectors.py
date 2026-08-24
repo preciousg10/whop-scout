@@ -74,6 +74,7 @@ DETAIL_DIALOG = ['[role="dialog"]', '.campaign-details-modal-bg']
 # The selectors below are RELATIVE TO THE DIALOG scope.
 DETAIL_NAME = ['h2']                       # visible title (sr-only h2 holds it too)
 DETAIL_CREATOR = ['span.truncate']         # "Creator Casino" in the header row
+DETAIL_APPROVAL_RATE = ['text=/[0-9]{1,3}\\s*%\\s*approval rate/i']  # "88% approval rate" (header)
 DETAIL_PAY = ['text=/\\$[0-9.,]+\\s*\\/\\s*1?[kKmM]/']          # "$1/1K views"
 DETAIL_BUDGET_TOTAL = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']  # "$136,713/$250,000"
 DETAIL_BUDGET_REMAINING = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']

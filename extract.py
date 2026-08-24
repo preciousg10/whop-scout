@@ -209,6 +209,31 @@ def parse_activity_count(modal_text):
     return n if 0 <= n <= _ACTIVITY_MAX else None
 
 
+# --- approval rate -------------------------------------------------------------
+# Every Whop campaign header shows an approval rate — "88% approval rate" — the % of
+# submissions that get approved/paid. A KNOWN-and-LOW rate means most clips are rejected
+# unpaid (wasted effort), so scoring deranks below a floor. It sits right after the
+# creator/name in the modal header ("<Name>\n<Creator>\n…\nNN% approval rate\n<Name>…"),
+# so the FIRST "NN% approval rate" in the modal text is the campaign's OWN rate. Pure/testable.
+_APPROVAL_RATE_RE = re.compile(r"([0-9]{1,3})\s*%\s*approval\s+rate", re.I)
+
+
+def parse_approval_rate(text):
+    """The campaign's own approval rate as an int 0..100, or None (UNKNOWN) when not present.
+    Reads the FIRST 'NN% approval rate' in the text (the header rate — the campaign's own).
+    Fails to None on anything out of 0..100 so a garbage match never penalizes. Never guessed."""
+    if not text:
+        return None
+    m = _APPROVAL_RATE_RE.search(text)
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return n if 0 <= n <= 100 else None
+
+
 # --- minimum-VIEW payout threshold ---------------------------------------------
 # DISTINCT from the minimum-payout-DOLLAR above: some campaigns pay NOTHING until a single
 # video crosses a hard VIEW count — "VIDEO MUST REACH 10K FOR PAYOUT" (TraxNYC), "minimum
@@ -867,9 +892,16 @@ def extract_detail(scope):
     if not rules:
         rules = _safe_inner_text(scope) or None
 
+    # approval rate — the header "NN% approval rate". Try the dedicated element, then fall
+    # back to parsing the dialog text (the header rate is the first "NN% approval rate").
+    approval_rate = parse_approval_rate(_text(scope, S.DETAIL_APPROVAL_RATE))
+    if approval_rate is None:
+        approval_rate = parse_approval_rate(rules)
+
     return {
         "name": _text(scope, S.DETAIL_NAME),
         "creator": _text(scope, S.DETAIL_CREATOR),
+        "approval_rate": approval_rate,
         "pay_value": pay["pay_value"],
         "pay_unit": pay["pay_unit"],
         "pay_per_1k": pay["pay_per_1k"],

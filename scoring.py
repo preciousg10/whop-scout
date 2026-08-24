@@ -332,6 +332,17 @@ def footage_presence_factor(footage_presence_penalty_factor):
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
+def approval_rate_factor(approval_rate_penalty_factor):
+    """Approval-rate derank. The resolved factor is computed upstream (enrich_active sets
+    rec['approval_rate_factor'] = cfg.approval_low_penalty when the KNOWN approval rate is below
+    cfg.approval_rate_floor, else 1.0), so this just validates it: a positive number is used
+    as-is, anything else -> neutral 1.0 (fail-open — a high-approval OR UNKNOWN-approval campaign
+    is left EXACTLY unchanged). A low approval rate means most submissions are rejected unpaid,
+    so clipping for it is wasted effort."""
+    f = approval_rate_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
 def openness_factor(open_to_all):
     """Weight campaigns open to an instant free join UP (the pipeline needs to start clipping
     immediately). 'yes' -> 1.1 (a plus), 'unclear' -> 1.0 (neutral — never guessed), 'no' ->
@@ -968,6 +979,12 @@ def composite_score(c):
     fpres = c.get("footage_presence") or {}
     fpres_fac = footage_presence_factor(c.get("footage_presence_factor"))
 
+    # approval-rate derank — heavy penalty when a KNOWN approval rate is below the floor (most
+    # submissions rejected unpaid). Resolved upstream in enrich_active from cfg.approval_low_
+    # penalty; high-approval / UNKNOWN -> 1.0 (fail-open), leaving those composites unchanged.
+    appr = c.get("approval_rate")
+    appr_fac = approval_rate_factor(c.get("approval_rate_factor"))
+
     # payout-health derank — is the campaign ACTUALLY paying? A paying-dead trap (meaningful
     # submissions but ~$0 ever paid out) is heavy-deranked; a genuinely new campaign with $0
     # paid is left untouched (fail-open). Factor resolved upstream in enrich_active.
@@ -985,7 +1002,8 @@ def composite_score(c):
         * earn_fac * rep_factor * mp_fac * vel_fac * comp_fac
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
-        * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac, 6)
+        * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac
+        * appr_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -1083,6 +1101,9 @@ def composite_score(c):
         "has_public_footage": fpres.get("has_public_footage"),
         "footage_link_count": fpres.get("footage_link_count"),
         "footage_presence_factor": fpres_fac,
+        # approval rate — heavy derank when a KNOWN rate is below the floor (fail-open on UNKNOWN)
+        "approval_rate": appr,
+        "approval_rate_factor": appr_fac,
         # payout health — is the campaign actually paying? (dead/healthy/new/ok/unknown)
         "payout_status": payout.get("status"),
         "payout_submissions": payout.get("submissions"),

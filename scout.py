@@ -201,6 +201,15 @@ class Config:
     # section was never loaded (unscraped stub), footage presence is undeterminable -> no penalty.
     no_footage_penalty: float = 0.15
 
+    # APPROVAL-RATE derank — every Whop campaign header shows an approval rate (the % of
+    # submissions that get approved/paid). A KNOWN rate BELOW approval_rate_floor means most
+    # clips are rejected unpaid (wasted effort), so the campaign is HEAVY-deranked (composite ×
+    # approval_low_penalty), NOT excluded. FAILS OPEN: an approval rate that isn't shown/parsed
+    # is UNKNOWN and never penalized; a known rate at/above the floor is untouched.
+    approval_derank_enabled: bool = True
+    approval_rate_floor: float = 65.0        # known approval rate below this -> derank
+    approval_low_penalty: float = 0.2        # composite × this when approval < floor (~80% off)
+
     # output paths
     state_path: str = "state.json"
     campaigns_path: str = "campaigns.json"
@@ -834,6 +843,7 @@ def build_record(card, detail, status):
         "rules_text": detail.get("rules_text"),
         "participants": detail.get("participants"),
         "deadline": detail.get("deadline"),
+        "approval_rate": detail.get("approval_rate"),   # header "NN% approval rate" (or None)
     }
     rec.update({k: (list(v) if isinstance(v, list) else v)
                 for k, v in _ANALYSIS_DEFAULTS.items()})
@@ -948,6 +958,22 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["footage_presence"] = fpres
     rec["footage_presence_factor"] = (cfg.no_footage_penalty
                                       if fpres.get("has_public_footage") is False else 1.0)
+
+    # APPROVAL RATE — the % of submissions a campaign approves/pays (shown in the header as
+    # "NN% approval rate"). A KNOWN-and-LOW rate means most clips are rejected unpaid, so a
+    # campaign below cfg.approval_rate_floor is DERANKED (not excluded). Prefer the value scraped
+    # off the detail header; otherwise recover it from the modal/rules text (the header rate is
+    # the first "NN% approval rate"). Fails OPEN: not shown/unparseable -> UNKNOWN -> no penalty;
+    # a rate at/above the floor is untouched. The resolved factor is stored so composite_score
+    # just multiplies it in.
+    appr = rec.get("approval_rate")
+    if not isinstance(appr, (int, float)) or isinstance(appr, bool):
+        appr = extract.parse_approval_rate(
+            " ".join(t for t in (rec.get("modal_requirements_text"), rec.get("rules_text")) if t))
+        rec["approval_rate"] = appr
+    known_low = (cfg.approval_derank_enabled and isinstance(appr, (int, float))
+                 and not isinstance(appr, bool) and appr < cfg.approval_rate_floor)
+    rec["approval_rate_factor"] = cfg.approval_low_penalty if known_low else 1.0
 
     # campaign age (first_seen carried across runs) + payout velocity
     first_seen = (prev_rec or {}).get("first_seen_at") or rec.get("first_seen_at") \
