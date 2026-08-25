@@ -955,6 +955,76 @@ def _detect_join_cta(scope):
     return "join" if saw_join else None
 
 
+# --- modal rules extraction ----------------------------------------------------
+# Rules live in DIFFERENT places per campaign. Some render the full requirements
+# inline in the modal (Santa Cruz: required hashtags, on-screen-text format, min
+# length, English-only, no watermark), some only leave a POINTER bullet ("SEE RULES
+# ... BELOW IN RESOURCES") and put the real rules in a linked Doc. The span.break-all
+# bullets often capture ONLY the pointer, so we also pull the substantive rules
+# section out of the dialog's full visible text for the clipper (modal_rules_text).
+
+# A requirements line that only POINTS elsewhere carries no actual rules — strip
+# these before judging substance so a pointer alone never reads as "has rules".
+RULES_POINTER_PHRASES = (
+    "refer to the google docs", "refer to the google doc", "refer to google docs",
+    "refer to google doc", "refer to the doc", "refer to the docs", "refer to the brief",
+    "refer to the resources", "refer to resources", "see the google doc", "see the doc",
+    "see the requirements doc", "see below", "see resources", "guidelines on content links",
+    "guidelines on the content links", "guidelines on content", "content requirements",
+    "in the google doc", "in the doc below", "link below", "links below",
+    "for the campaign requirements", "for the requirements", "campaign requirements",
+    "see rules, requirements, and content document below in resources",
+    "rules, requirements, and content document below in resources",
+)
+# Words/patterns that betray REAL rules even in a short section.
+RULE_SIGNAL_RE = re.compile(
+    r"\b(must|required|do not|don'?t|banned|prohibited|watermark|caption|hashtag|on-?screen|"
+    r"audience|tier|provided footage|no outside|comment|mention|disclosure|geo|min |max )"
+    r"|#\w|\d+%", re.I)
+
+
+def modal_rules_section(modal_text):
+    """The requirements/guidelines section of the modal text (between a 'Content
+    Requirements'/'Requirements' heading and the Earnings/Analytics/Resources blocks),
+    or '' if none. Pure — no Playwright."""
+    if not modal_text:
+        return ""
+    t = " ".join(modal_text.split())
+    m = re.search(r"Content Requirements(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)",
+                  t, re.I | re.S) or re.search(
+        r"\bRequirements\b(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)", t, re.I | re.S)
+    return (m.group(1).strip() if m else "")
+
+
+def has_substantive_rules(text):
+    """True if `text` carries actual rules (not just a pointer to a doc). Substance =
+    enough words left after removing pointer phrases, OR any concrete rule-signal
+    keyword. Pure — no Playwright."""
+    if not text or not text.strip():
+        return False
+    low = text.lower()
+    for p in RULES_POINTER_PHRASES:
+        low = low.replace(p, " ")
+    words = re.findall(r"[a-z0-9%+$#]+", low)
+    return len(words) >= 6 or bool(RULE_SIGNAL_RE.search(text))
+
+
+def full_modal_rules(full_text, bullets=None):
+    """The best available FULL rules text for the clipper, drawn from the modal.
+    Prefers the clean requirements SECTION of the dialog text; falls back to the whole
+    dialog text when it carries real rules but has no clean heading; else to substantive
+    bullets. Returns None when only a pointer (or nothing) is present. Pure — no
+    Playwright, safe to test on plain strings."""
+    section = modal_rules_section(full_text)
+    if has_substantive_rules(section):
+        return section
+    if has_substantive_rules(full_text):
+        return (full_text or "").strip() or None
+    if has_substantive_rules(bullets):
+        return (bullets or "").strip() or None
+    return None
+
+
 def extract_detail(scope):
     """Detail fields from the campaign dialog. `scope` is the dialog Locator (or a
     frame/page). Missing -> None; never raises."""
@@ -964,10 +1034,22 @@ def extract_detail(scope):
     platforms_text = _text(scope, S.DETAIL_PLATFORMS) if S.DETAIL_PLATFORMS else None
     source_links = [absolute(h) for h in _all_hrefs(scope, S.SOURCE_LINK_SELECTORS)]
 
+    # The dialog's full visible text — pulled from the dialog Locator that already
+    # yielded pay/budget/approval, so it is reliable even when the separate frame-eval
+    # capture (modal_requirements_text) comes back empty.
+    dialog_text = _safe_inner_text(scope) or None
+
     # Requirement bullets (span.break-all); fall back to the whole dialog text.
     rules = _join_texts(scope, S.DETAIL_RULES)
     if not rules:
-        rules = _safe_inner_text(scope) or None
+        rules = dialog_text
+
+    # Full rules for the clipper: many campaigns leave only a POINTER bullet in
+    # span.break-all ("SEE RULES ... BELOW IN RESOURCES") while the real rules
+    # (hashtags, on-screen format, requirements) render elsewhere in the modal. Pull the
+    # substantive rules section out of the dialog text so the clipper gets real rules,
+    # not just the pointer. rules_text (the scoring input) is left as-is.
+    modal_rules_text = full_modal_rules(dialog_text, rules)
 
     # approval rate — the header "NN% approval rate". Try the dedicated element, then fall
     # back to parsing the dialog text (the header rate is the first "NN% approval rate").
@@ -988,6 +1070,8 @@ def extract_detail(scope):
         "platforms": parse_platforms(platforms_text),
         "source_links": source_links,
         "rules_text": rules,
+        "modal_rules_text": modal_rules_text,
+        "dialog_text": dialog_text,   # full modal innerText; backfills modal_requirements_text
         "participants": parse_int(_text(scope, S.DETAIL_PARTICIPANTS)) if S.DETAIL_PARTICIPANTS else None,
         "deadline": _text(scope, S.DETAIL_DEADLINE),
         "join_cta": _detect_join_cta(scope),

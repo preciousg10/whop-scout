@@ -51,7 +51,8 @@ There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 `parse_int`, `campaign_id_from_url`, `parse_min_payout`, `min_views_to_payout`,
 `parse_min_view_threshold`, `references_resource_doc`, `extract_handles`, `parse_max_payout`,
 `participants_per_1k_budget`, `payout_velocity`, `parse_activity_count`,
-`detect_disqualifiers`, `classify_openness`, `classify_category`, `classify_categories`) are pure functions with no
+`detect_disqualifiers`, `classify_openness`, `classify_category`, `classify_categories`,
+`modal_rules_section`, `has_substantive_rules`, `full_modal_rules`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
 (`pre_score`, `clippability`, `composite_score`, `pay_rate_factor`, `reach_factor`,
 `expected_earnings`, `earnings_factor`, `core_signals_known`, `data_confidence_factor`,
@@ -575,9 +576,27 @@ mounted behind it). So Phase 2 (`open_detail` → `extract_detail(dialog)` →
   campaign", exact=True)` — lookup is by **accessible name**, so it never depends on
   list scroll position surviving (the card re-resolves wherever it is).
 - `extract_detail` is scoped to the **dialog Locator**; `DETAIL_*` selectors are
-  relative to it. Rules come from `span.break-all` bullets (joined), budget is the same
-  `$paid/$total` pair, pay is `$1/1K views`. Source links (`drive.google`/`youtube`)
+  relative to it. Rules come from `span.break-all` bullets (joined) into `rules_text`, budget is
+  the same `$paid/$total` pair, pay is `$1/1K views`. Source links (`drive.google`/`youtube`)
   appear only on campaigns that have them.
+- **Full modal rules → `modal_rules_text` (the clipper's rules field).** The `span.break-all`
+  bullets often capture ONLY a POINTER ("SEE RULES … BELOW IN RESOURCES") while the REAL rules
+  (required hashtags, on-screen-text format, min length, English-only, no-watermark — the Santa
+  Cruz case) render elsewhere in the modal, so `rules_text` alone left the clipper with nothing
+  and submissions got rejected. `extract_detail` now also reads the dialog's FULL visible
+  innerText (`dialog_text`, via the dialog Locator that already yields pay/budget/approval — so
+  it is reliable even when the separate frame-eval `modal_requirements_text` capture comes back
+  empty) and `extract.full_modal_rules` pulls the substantive requirements SECTION out of it
+  into `modal_rules_text`. `full_modal_rules`/`modal_rules_section`/`has_substantive_rules` are
+  pure (testable on plain strings; also the canonical source for scout's rules-readability
+  helpers). It returns None on a pointer-only/empty modal (never fabricates rules). Before
+  reading, `scout._expand_dialog_text` best-effort clicks any "See more"/"Read more" toggle
+  (`selectors.DETAIL_RULES_EXPAND`) so truncated rules fully render; `scrape_detail` backfills
+  `modal_requirements_text` from `dialog_text` when the frame path was empty, then re-derives
+  `modal_rules_text` from whichever body it ended up with. **`rules_text` (the scoring input) is
+  left UNCHANGED** — this is capture-only, no ranking/scoring change. Any rules-doc LINK in the
+  modal is already captured into `resource_links` (the clipper auto-fetches those), so both the
+  modal TEXT and any rules-doc LINK are covered.
 - **Stats chart (Views / Submissions) — INTENTIONALLY NOT SCRAPED.** The dialog has a
   Views/Submissions chart, but views-per-submission was DROPPED as a signal (an average over
   a fat-tailed clip distribution — two viral clips out of 2,000 read "healthy" while everyone

@@ -777,7 +777,8 @@ _ANALYSIS_DEFAULTS = {
     # requirements/guidelines text, ALL resource anchors (rules docs AND footage folders, each
     # labelled), and the on-modal stats. The clipper reads rules from BOTH the on-modal text
     # AND the linked docs, whichever a campaign uses.
-    "modal_requirements_text": None, "resource_links": [], "modal_stats": None,
+    "modal_requirements_text": None, "modal_rules_text": None, "resource_links": [],
+    "modal_stats": None,
     # resource-capture reliability cross-check: the modal TEXT references a linked
     # Doc/Drive/Notion/folder but resource_links came back EMPTY (a silently-missed doc). This
     # is DETECTION only — capture logic is unchanged — surfaced as a report warning so a missed
@@ -875,6 +876,9 @@ def build_record(card, detail, status):
     rec["brief_url"] = detail.get("brief_url")
     rec["frame_url"] = detail.get("frame_url")
     rec["modal_requirements_text"] = detail.get("modal_requirements_text")
+    # Full rules from the modal for the clipper (hashtags / on-screen format / requirements),
+    # not just the pointer bullet that lands in rules_text. See extract.full_modal_rules.
+    rec["modal_rules_text"] = detail.get("modal_rules_text")
     rec["resource_links"] = detail.get("resource_links") or []
     rec["modal_stats"] = detail.get("modal_stats")
     rec["locator_missing"] = not (rec["url"] or rec["campaign_id"])
@@ -1140,6 +1144,27 @@ def _scroll_dialog(page, pacer):
         pass
 
 
+def _expand_dialog_text(dialog):
+    """Best-effort: click any 'See more' / 'Read more' / 'Show more' toggle inside the detail
+    dialog so collapsed rules text fully renders before we read it. Some campaigns truncate a
+    long requirements block behind such a toggle, and the hidden portion isn't in innerText
+    until expanded. Scoped to the dialog Locator, capped, and NEVER raises — a missing toggle
+    or a slow click is a silent no-op (the read still proceeds on whatever is visible)."""
+    for sel in S.DETAIL_RULES_EXPAND:
+        try:
+            locs = dialog.locator(sel)
+            n = min(locs.count(), 4)
+        except Exception:
+            continue
+        for i in range(n):
+            try:
+                loc = locs.nth(i)
+                if loc.is_visible(timeout=500):
+                    loc.click(timeout=1500)
+            except Exception:
+                continue
+
+
 def _frame_url(page):
     fr = get_app_frame(page)
     return fr.url if fr else None
@@ -1402,46 +1427,11 @@ def _capture_locator(page, fl, list_page_url):
 # segregated with a reason). Notion being present but REDUNDANT (real rules also on-modal or
 # in a Doc) is never a reason to drop a campaign.
 
-# A requirements section that only POINTS elsewhere ("Refer to the Google Docs…", "Guidelines
-# on content links") carries no actual rules — strip these before judging substance.
-_RULES_POINTER_PHRASES = (
-    "refer to the google docs", "refer to the google doc", "refer to google docs",
-    "refer to google doc", "refer to the doc", "refer to the docs", "refer to the brief",
-    "refer to the resources", "refer to resources", "see the google doc", "see the doc",
-    "see the requirements doc", "see below", "see resources", "guidelines on content links",
-    "guidelines on the content links", "guidelines on content", "content requirements",
-    "in the google doc", "in the doc below", "link below", "links below",
-    "for the campaign requirements", "for the requirements", "campaign requirements",
-)
-# Words that betray REAL rules even in a short section.
-_RULE_SIGNAL_RE = re.compile(
-    r"\b(must|required|do not|don'?t|banned|prohibited|watermark|caption|hashtag|on-?screen|"
-    r"audience|tier|provided footage|no outside|comment|mention|disclosure|geo|min |max )"
-    r"|#\w|\d+%", re.I)
-
-
-def _modal_rules_section(modal_text):
-    """The requirements/guidelines section of the modal text (between 'Content Requirements'
-    and the Earnings/Analytics/Resources blocks), or '' if none."""
-    if not modal_text:
-        return ""
-    t = " ".join(modal_text.split())
-    m = re.search(r"Content Requirements(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)",
-                  t, re.I | re.S) or re.search(
-        r"\bRequirements\b(.*?)(?:\bEarnings\b|\bAnalytics\b|\bResources\b|$)", t, re.I | re.S)
-    return (m.group(1).strip() if m else "")
-
-
-def _has_substantive_rules(text):
-    """True if `text` carries actual rules (not just a pointer to a doc). Substance = enough
-    words left after removing pointer phrases, OR any concrete rule-signal keyword."""
-    if not text or not text.strip():
-        return False
-    low = text.lower()
-    for p in _RULES_POINTER_PHRASES:
-        low = low.replace(p, " ")
-    words = re.findall(r"[a-z0-9%+$#]+", low)
-    return len(words) >= 6 or bool(_RULE_SIGNAL_RE.search(text))
+# The pointer-phrase list, rule-signal regex, and the section/substance helpers are the
+# canonical pure versions in extract.py (also used to build modal_rules_text during the scrape);
+# these thin wrappers keep resolve_rules_readability reading from one source of truth.
+_modal_rules_section = extract.modal_rules_section
+_has_substantive_rules = extract.has_substantive_rules
 
 
 def _rules_gdoc_links(resource_links):
@@ -1831,6 +1821,7 @@ def scrape_detail(page, fl, name, list_page_url, pacer, cfg):
     detail, loc = {}, {}
     try:
         _scroll_dialog(page, pacer)
+        _expand_dialog_text(dialog)   # reveal any collapsed "see more" rules before reading
         detail = extract.extract_detail(dialog)
         # PRIMARY: the app-frame route carries the campaign UUID once the modal is open
         # (confirmed via --test-capture). Navigation-free and reliable — also grabs brief_url.
@@ -1850,7 +1841,14 @@ def scrape_detail(page, fl, name, list_page_url, pacer, cfg):
     detail["campaign_id"] = loc.get("campaign_id")
     detail["brief_url"] = loc.get("brief_url")
     detail["frame_url"] = loc.get("frame_url")
-    detail["modal_requirements_text"] = loc.get("modal_requirements_text")
+    # modal_requirements_text comes from the frame-eval capture, but that path can come back
+    # EMPTY even when the dialog rendered fine (the frame lookup failed while the dialog Locator
+    # worked). Backfill from the dialog's own innerText so the on-modal rules are never lost.
+    detail["modal_requirements_text"] = loc.get("modal_requirements_text") or detail.get("dialog_text")
+    # And re-derive the clipper's full rules from whichever modal text we ended up with, so a
+    # backfilled body still yields real rules rather than the pointer bullet.
+    detail["modal_rules_text"] = detail.get("modal_rules_text") or extract.full_modal_rules(
+        detail.get("modal_requirements_text"), detail.get("rules_text"))
     detail["resource_links"] = loc.get("resource_links") or []
     detail["modal_stats"] = loc.get("modal_stats")
     return detail

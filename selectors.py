@@ -80,6 +80,14 @@ DETAIL_BUDGET_TOTAL = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']  # "$136,713/$2
 DETAIL_BUDGET_REMAINING = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']
 DETAIL_PLATFORMS = []                       # shown as bare SVG icons, no text
 DETAIL_RULES = ['span.break-all']          # requirement bullets; joined in extract
+# "See more" / "Read more" / "Show more" toggles that collapse long rules text. Clicked
+# best-effort before reading so truncated requirements fully render (scout._expand_dialog_text).
+# Unconfirmed — degrades to a no-op when absent.
+DETAIL_RULES_EXPAND = [
+    'button:has-text("See more")', 'button:has-text("Read more")',
+    'button:has-text("Show more")', 'text=/^\\s*see more\\s*$/i',
+    'text=/^\\s*read more\\s*$/i', 'text=/^\\s*show more\\s*$/i',
+]
 DETAIL_PARTICIPANTS = ['text=/[0-9][0-9,]*\\s*(?:clippers|participants|creators)/i']
 DETAIL_DEADLINE = ['text=/deadline|ends|closes/i']
 # Primary join CTA — an "Apply" button means the campaign is application-gated (selection
