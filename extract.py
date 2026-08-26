@@ -329,6 +329,12 @@ _MV_AFTER = (r"(?:for\s+payout|to\s+(?:be\s+paid|get\s+paid|qualify|cash\s*out|w
              r"payout|earn|count|be\s+eligible)|before\s+payout|required|minimum)")
 _MV_PAYOUT_CTX = (r"(?:for\s+payout|to\s+(?:be|get)\s+paid|before\s+payout|"
                   r"to\s+(?:qualify|payout|earn|count|be\s+eligible)|payout)")
+# Spanish/Portuguese: a MINIMUM payout gated behind a VIEW count — "Pago mínimo por reel: $4
+# (10.000 visualizaciones)", "mínimo 10.000 visitas para pagar/cobrar", "necesitas N vistas
+# para el pago". Anchored on MÍNIMO (never máximo) so the max-payout view figure is not read as
+# a gate. Numbers use European "." grouping ("10.000" = 10,000) — handled by _views_to_int.
+_MV_VIEWS_ES = r"(?:visualizaciones|visualizacoes|visualizações|visitas|vistas|reproducciones|reproduccoes|reproduções|views)"
+_MV_MIN_ES = r"(?:pago\s+m[íi]nimo|m[íi]nimo\s+(?:de\s+)?(?:pago|retiro)|para\s+(?:pagar|cobrar|el\s+pago|el\s+retiro|retirar))"
 _MIN_VIEW_PATTERNS = (
     # A: gating word, then "<num> views"  — "must reach 10K views", "minimum 10,000 views"
     _MV_BEFORE + r"\s+(?:of\s+)?([0-9][0-9.,]*)\s*([kKmMbB]?)\s*" + _VIEWS,
@@ -338,15 +344,32 @@ _MIN_VIEW_PATTERNS = (
     #    then payout context — catches "MUST REACH 10K FOR PAYOUT" (unit is mandatory here).
     _MV_BEFORE + r"\s+([0-9][0-9.,]*)\s*([kKmMbB])\b(?!\s*(?:follow|sub|dollar|usd))"
     r"[^.\n]{0,20}?" + _MV_PAYOUT_CTX,
+    # D (ES/PT): "pago mínimo ... <num> visualizaciones/visitas" — minimum payout tied to views.
+    _MV_MIN_ES + r"[^.\n]{0,40}?([0-9][0-9.,]*)\s*([kKmMbB]?)\s*" + _MV_VIEWS_ES,
+    # E (ES/PT): "<num> visualizaciones/visitas ... para pagar/cobrar / mínimo" — gate after count.
+    r"([0-9][0-9.,]*)\s*([kKmMbB]?)\s*" + _MV_VIEWS_ES +
+    r"[^.\n]{0,30}?(?:para\s+(?:pagar|cobrar)|m[íi]nimo)",
 )
 
 
 def _views_to_int(numstr, unit):
+    """View count -> int, handling US ('10,000'/'1.5K') AND European ('10.000') number formats.
+    A dot/comma run of 3-digit groups ('10.000', '1,234,567') is thousands grouping and is
+    stripped; a single dot/comma with 1-2 trailing digits next to a k/m/b unit ('1,5K') is a
+    decimal. None on garbage."""
+    s = str(numstr).strip()
+    u = (unit or "").lower()
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", s):        # 10.000 / 10,000 / 1.234.567 -> grouped
+        s = s.replace(".", "").replace(",", "")
+    elif re.fullmatch(r"\d+[.,]\d{1,2}", s) and u in ("k", "m", "b"):  # 1,5K / 1.5K -> decimal
+        s = s.replace(",", ".")
+    else:
+        s = s.replace(",", "")
     try:
-        n = float(str(numstr).replace(",", ""))
+        n = float(s)
     except (TypeError, ValueError):
         return None
-    mult = {"k": 1e3, "m": 1e6, "b": 1e9}.get((unit or "").lower(), 1)
+    mult = {"k": 1e3, "m": 1e6, "b": 1e9}.get(u, 1)
     return int(round(n * mult))
 
 
@@ -369,6 +392,81 @@ def parse_min_view_threshold(text):
             if val is not None and val >= _MIN_VIEW_FLOOR:
                 found.append(val)
     return max(found) if found else None
+
+
+# --- dedicated-page/account requirement ---------------------------------------
+# A real trap: the rules demand a page/account/channel used ONLY for this campaign's content
+# ("must be a dedicated page for X", "página dedicada únicamente al contenido de X"). That burns
+# a whole account slot and is incompatible with a general themed clip account, so scoring deranks
+# it below campaigns usable from an account I already run. English + Spanish/Portuguese. Detection
+# is high-precision (fail-open): only explicit "dedicated/exclusive page/account" language fires,
+# never a passing "we're dedicated to quality". The object phrase is captured for the report.
+_DEDICATED_PAGE_RE = re.compile(
+    # EN: "dedicated page/account/channel/profile [for/to X]" / "page dedicated to/only X"
+    r"\bdedicated\s+(?:page|account|channel|profile|handle)\b(?:\s+(?:for|to|only|solely|"
+    r"exclusively)[^.\n]{0,40})?"
+    r"|\b(?:page|account|channel|profile)\s+(?:that\s+is\s+|must\s+be\s+|entirely\s+)?"
+    r"dedicated\s+(?:to|only|solely|exclusively)[^.\n]{0,40}"
+    r"|\b(?:page|account|channel)\s+(?:used\s+)?(?:only|solely|exclusively)\s+for[^.\n]{0,40}"
+    r"|\bseparate\s+(?:dedicated\s+)?(?:page|account|channel)\s+(?:for|dedicated)[^.\n]{0,40}"
+    # ES/PT: "página/cuenta/canal/perfil dedicad[ao] [únicamente] [al contenido de X]"
+    r"|\b(?:p[áa]gina|cuenta|canal|perfil)\s+dedicad[ao]s?(?:\s+[úu]nicamente|\s+exclusivamente)?"
+    r"(?:\s+(?:al?|a\s+la|para|ao?|à)[^.\n]{0,40})?"
+    # ES/PT: "página/cuenta exclusiva [para X]"
+    r"|\b(?:p[áa]gina|cuenta|canal|perfil)\s+exclusiv[ao]s?(?:\s+(?:para|de|al?)[^.\n]{0,40})?",
+    re.I)
+
+
+def detect_dedicated_page(text):
+    """The matched phrase if the rules require a DEDICATED page/account (used only for this
+    campaign's content — a real account-slot cost), else None. English + Spanish/Portuguese,
+    high-precision/fail-open. Pure/testable."""
+    if not text:
+        return None
+    m = _DEDICATED_PAGE_RE.search(text)
+    if not m:
+        return None
+    return " ".join(m.group(0).split())[:120]
+
+
+# --- member-gated / incomplete rules -------------------------------------------
+# Some campaigns keep the REAL rules behind joining ("CHECK FULL GUIDELINES ON SIDEBAR AFTER YOU
+# JOIN", "full rules after joining", "reglas completas después de unirte"), so Scout only ever
+# sees a PARTIAL rule set. This is a FLAG (not a derank): it tells me the captured rules can't be
+# fully trusted. High-precision English + Spanish/Portuguese; fail-open (no match -> None).
+_RULES_INCOMPLETE_RE = re.compile(
+    # EN: "full/complete/detailed guidelines|rules|requirements ... after/once you join/accepted"
+    r"\b(?:full|complete|all|detailed|the\s+full|the\s+complete)\s+"
+    r"(?:guidelines?|rules?|requirements?|details?|instructions?|brief)\b[^.\n]{0,50}?"
+    r"\b(?:after|once|when|upon)\s+(?:you\s+)?(?:join|joining|are\s+accepted|accepted|inside)\b"
+    # EN: "after/once you join ... guidelines|rules|sidebar|discord|whop"
+    r"|\b(?:after|once|when)\s+(?:you\s+)?(?:join|joining|are\s+accepted)\b[^.\n]{0,50}?"
+    r"\b(?:guidelines?|rules?|requirements?|full\s+details?|sidebar|whop|discord|server)\b"
+    # EN: "join to see/access the (full) rules|guidelines"
+    r"|\bjoin\s+(?:to\s+)?(?:see|view|access|read|get|unlock)\s+(?:the\s+)?(?:full\s+)?"
+    r"(?:rules?|guidelines?|requirements?|details?)\b"
+    # EN: "guidelines/rules on the sidebar|discord|whop" (the sidebar/whop is post-join)
+    r"|\b(?:full\s+)?(?:guidelines?|rules?)\s+(?:are\s+)?(?:on|in)\s+(?:the\s+)?"
+    r"(?:sidebar|whop\s+(?:sidebar|channel)|discord\s+(?:after|once))\b"
+    # ES/PT: "reglas/normas/guía completas ... después de/al unir(te|se)/entrar"
+    r"|\b(?:reglas?|normas?|gu[íi]as?|requisitos?|instrucciones?|regras?)\s+"
+    r"(?:completa?s?|detallada?s?|completas?)\b[^.\n]{0,50}?"
+    r"\b(?:despu[ée]s\s+de|al|una\s+vez\s+que)\s+(?:unir(?:te|se)|entrar|ingresar|aceptad)"
+    r"|\b(?:despu[ée]s\s+de|al|una\s+vez)\s+(?:unir(?:te|se)|entrar|ingresar)\b[^.\n]{0,50}?"
+    r"\b(?:reglas?|normas?|gu[íi]a|requisitos?|regras?)\b",
+    re.I)
+
+
+def detect_rules_incomplete(text):
+    """The matched phrase if the rules say the FULL guidelines live behind joining (so the
+    captured rules are only PARTIAL), else None. English + Spanish/Portuguese; a FLAG, not a
+    derank. High-precision/fail-open. Pure/testable."""
+    if not text:
+        return None
+    m = _RULES_INCOMPLETE_RE.search(text)
+    if not m:
+        return None
+    return " ".join(m.group(0).split())[:120]
 
 
 # --- resource-doc reference (capture cross-check) ------------------------------

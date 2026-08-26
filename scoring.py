@@ -332,14 +332,42 @@ def footage_presence_factor(footage_presence_penalty_factor):
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
+def approval_rate_scaled(rate, floor=65.0, mild=0.85, severe_at=20.0, severe=0.05):
+    """Scaled approval-rate derank — the penalty grows with HOW LOW the approval rate is.
+
+    A low approval rate means most submissions are rejected unpaid (wasted effort). UNKNOWN
+    (None) or a rate at/above `floor` -> 1.0 (fail-open, no penalty). Just below the floor is a
+    MILD derank (`mild`); between the floor and `severe_at` it interpolates linearly down; at or
+    below `severe_at` it floors at `severe` — a near-exclusion, so a 6%-approval campaign
+    (Michael Sartain's Clipping Army) sinks to the bottom instead of ranking #1. Pure/testable."""
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        return 1.0
+    if rate >= floor:
+        return 1.0
+    if rate <= severe_at:
+        return round(severe, 4)
+    t = (floor - rate) / (floor - severe_at)   # 0 at the floor -> 1 at severe_at
+    return round(mild + t * (severe - mild), 4)
+
+
 def approval_rate_factor(approval_rate_penalty_factor):
     """Approval-rate derank. The resolved factor is computed upstream (enrich_active sets
-    rec['approval_rate_factor'] = cfg.approval_low_penalty when the KNOWN approval rate is below
-    cfg.approval_rate_floor, else 1.0), so this just validates it: a positive number is used
-    as-is, anything else -> neutral 1.0 (fail-open — a high-approval OR UNKNOWN-approval campaign
-    is left EXACTLY unchanged). A low approval rate means most submissions are rejected unpaid,
-    so clipping for it is wasted effort."""
+    rec['approval_rate_factor'] via approval_rate_scaled — mild near the floor, ~0.05 for a
+    very-low rate, 1.0 for a high/UNKNOWN rate), so this just validates it: a positive number is
+    used as-is, anything else -> neutral 1.0 (fail-open — a high-approval OR UNKNOWN-approval
+    campaign is left EXACTLY unchanged)."""
     f = approval_rate_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
+def dedicated_page_factor(dedicated_page_penalty_factor):
+    """Dedicated-page/account-required derank. The resolved factor is computed upstream
+    (enrich_active sets rec['dedicated_page_factor'] = cfg.dedicated_page_penalty when the rules
+    demand a page/account used ONLY for this campaign's content, else 1.0), so this just
+    validates it: a positive number is used as-is, anything else -> neutral 1.0 (fail-open — a
+    campaign usable from a general account is left EXACTLY unchanged). A dedicated page burns a
+    whole account slot, so it should rank below campaigns I can feed from an account I run."""
+    f = dedicated_page_penalty_factor
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
@@ -474,6 +502,40 @@ def min_view_threshold_factor(threshold):
 
 
 # --- payout velocity -----------------------------------------------------------
+# Prefer the OBSERVED budget drain (from snapshot history) over cumulative paid/tracking-age
+# once we've watched a campaign for at least this long. Cumulative velocity =
+# (total_paid/total)/tracking_age OVER-states an OLD campaign first seen recently: all its
+# lifetime spend gets divided by a short tracking age and reads "fast" even though it's barely
+# moving now. The observed drain-per-day across runs is the honest, AGE-AWARE spend rate.
+VELOCITY_OBSERVED_MIN_SPAN_DAYS = 3.0
+
+
+def effective_velocity(c):
+    """(velocity, basis) — the payout velocity feeding velocity_band/velocity_factor.
+
+    FIX 5 (age-aware): the cumulative velocity = (total_paid/total)/tracking_age OVERSTATES an
+    OLD campaign first seen recently — all its lifetime spend divided by a short tracking age
+    reads 'fast' even though it's barely moving now (Golden Circle: ~82% spent, but only ~$28/day
+    across the window we've watched). The OBSERVED drain-per-day across snapshots is the honest,
+    age-aware rate. But observed drain is only used to DOWNGRADE, and only when it's a CLEAN,
+    reliable signal — a positive drain over a meaningful span that is LOWER than cumulative (i.e.
+    it reveals cumulative overstated). A non-positive observed drain is discarded: it usually
+    means a mid-window budget TOP-UP / reset (the budget fraction went UP — the Santa Cruz case),
+    NOT a real stall, and must never flip a paying campaign to 'dead'. In every ambiguous case we
+    fall back to the cumulative velocity, so a clean campaign is left EXACTLY unchanged. Pure."""
+    cumulative = c.get("payout_velocity")
+    drain = c.get("budget_drain") or {}
+    dpd = drain.get("drain_per_day")
+    span = drain.get("span_days")
+    reliable = (isinstance(dpd, (int, float)) and not isinstance(dpd, bool) and dpd > 0
+                and isinstance(span, (int, float)) and not isinstance(span, bool)
+                and span >= VELOCITY_OBSERVED_MIN_SPAN_DAYS)
+    # only act as a DOWNGRADE — never upgrade off a noisy recent burst, never bury on a reset
+    if reliable and isinstance(cumulative, (int, float)) and dpd < cumulative:
+        return dpd, "observed"
+    return cumulative, "cumulative"
+
+
 def velocity_band(velocity, days_active):
     # Calibrated so a healthy campaign clears its budget in ~20–40 days (~0.025–0.05/day);
     # the user's example — $200 of $2,000 after 10 days = 0.01/day — is "slow", a negative.
@@ -927,7 +989,9 @@ def composite_score(c):
     uncapped = bool(c.get("max_payout_uncapped"))
     mp_fac = max_payout_factor(mp, uncapped)
 
-    vel = c.get("payout_velocity")
+    # velocity — prefer OBSERVED drain across runs over cumulative paid/tracking-age (FIX 5),
+    # so an old, mostly-spent, dead-slow campaign no longer reads 'fast' off its high %-spent.
+    vel, vel_basis = effective_velocity(c)
     days = c.get("days_active")
     vel_fac = velocity_factor(vel, days)
     vel_band = velocity_band(vel, days)
@@ -1001,6 +1065,11 @@ def composite_score(c):
     # upstream from cfg.self_sourced_penalty; provides-footage / ambiguous -> 1.0 (fail-open).
     ss_fac = self_sourced_factor(c.get("self_sourced_factor"))
 
+    # dedicated-page/account derank — the rules demand a page used ONLY for this campaign's
+    # content (burns a whole account slot). Resolved upstream from cfg.dedicated_page_penalty;
+    # usable-from-a-general-account / unknown -> 1.0 (fail-open).
+    dp_fac = dedicated_page_factor(c.get("dedicated_page_factor"))
+
     # payout-health derank — is the campaign ACTUALLY paying? A paying-dead trap (meaningful
     # submissions but ~$0 ever paid out) is heavy-deranked; a genuinely new campaign with $0
     # paid is left untouched (fail-open). Factor resolved upstream in enrich_active.
@@ -1019,7 +1088,7 @@ def composite_score(c):
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
         * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac
-        * appr_fac * ss_fac, 6)
+        * appr_fac * ss_fac * dp_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -1063,6 +1132,7 @@ def composite_score(c):
         "max_payout_uncapped": uncapped,
         "max_payout_factor": mp_fac,
         "payout_velocity": vel,
+        "velocity_basis": vel_basis,   # 'observed' (drain across runs) vs 'cumulative' (age-honest)
         "velocity_band": vel_band,
         "velocity_factor": vel_fac,
         "days_active": days,
@@ -1124,6 +1194,15 @@ def composite_score(c):
         "self_sourced": bool(c.get("self_sourced")),
         "self_sourced_phrase": c.get("self_sourced_phrase"),
         "self_sourced_factor": ss_fac,
+        # dedicated-page required — derank when the rules demand an account used only for this
+        # campaign (burns an account slot). Fail-open when usable from a general account.
+        "dedicated_page_required": bool(c.get("dedicated_page_required")),
+        "dedicated_page_phrase": c.get("dedicated_page_phrase"),
+        "dedicated_page_factor": dp_fac,
+        # member-gated rules FLAG (not a derank) — the full rules live behind joining, so the
+        # captured rules are only PARTIAL and shouldn't be fully trusted.
+        "rules_incomplete": bool(c.get("rules_incomplete")),
+        "rules_incomplete_phrase": c.get("rules_incomplete_phrase"),
         # payout health — is the campaign actually paying? (dead/healthy/new/ok/unknown)
         "payout_status": payout.get("status"),
         "payout_submissions": payout.get("submissions"),

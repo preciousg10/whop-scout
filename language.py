@@ -152,12 +152,16 @@ def detect_language(*texts):
 
 
 def language_text(campaign):
-    """Cheap text bundle for detection: name + rules + on-modal requirements + creator
-    handle/description (all already scraped — no new work)."""
+    """Cheap text bundle for detection: name + EVERY captured rules body (bullets, on-modal
+    requirements, the substantive modal rules section, and any fetched Notion/Google-Doc text) +
+    creator handle/description (all already scraped — no new work). Reading every rules body (not
+    just rules_text + modal_requirements_text) is FIX 4: a Spanish campaign whose rules landed in
+    modal_rules_text or a fetched doc is still detected instead of slipping through as English."""
     src = campaign.get("source") or {}
     handles = " ".join(h.get("handle") or h.get("url") or ""
                        for h in (src.get("handles") or []) if isinstance(h, dict))
     return " ".join(str(x) for x in (
         campaign.get("name"), campaign.get("rules_text"),
-        campaign.get("modal_requirements_text"), campaign.get("notion_rules_text"),
+        campaign.get("modal_requirements_text"), campaign.get("modal_rules_text"),
+        campaign.get("notion_rules_text"), campaign.get("rules_doc_text"),
         src.get("name"), src.get("description"), handles) if x)

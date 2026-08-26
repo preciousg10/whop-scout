@@ -203,13 +203,39 @@ class Config:
     no_footage_penalty: float = 0.15
 
     # APPROVAL-RATE derank — every Whop campaign header shows an approval rate (the % of
-    # submissions that get approved/paid). A KNOWN rate BELOW approval_rate_floor means most
-    # clips are rejected unpaid (wasted effort), so the campaign is HEAVY-deranked (composite ×
-    # approval_low_penalty), NOT excluded. FAILS OPEN: an approval rate that isn't shown/parsed
-    # is UNKNOWN and never penalized; a known rate at/above the floor is untouched.
+    # submissions that get approved/paid). A KNOWN rate BELOW approval_rate_floor is deranked, and
+    # the penalty now SCALES with how low it is (scoring.approval_rate_scaled): mild just under the
+    # floor, a NEAR-EXCLUSION (~approval_severe_penalty) at/below approval_severe_threshold — so a
+    # 6%-approval campaign sinks to the bottom instead of ranking #1. FAILS OPEN: an approval rate
+    # that isn't shown/parsed is UNKNOWN and never penalized; a rate at/above the floor is untouched.
     approval_derank_enabled: bool = True
-    approval_rate_floor: float = 65.0        # known approval rate below this -> derank
-    approval_low_penalty: float = 0.2        # composite × this when approval < floor (~80% off)
+    approval_rate_floor: float = 65.0        # known approval rate below this -> derank starts
+    approval_mild_penalty: float = 0.85      # factor JUST under the floor (mild)
+    approval_severe_threshold: float = 20.0  # at/below this approval rate -> near-exclusion
+    approval_severe_penalty: float = 0.05    # factor at/below the severe threshold (~95% off)
+    approval_low_penalty: float = 0.2        # DEPRECATED (kept for back-compat); scaling now used
+
+    # DEDICATED-PAGE / account requirement derank — the rules demand a page/account used ONLY for
+    # this campaign's content ("dedicated page", "página dedicada únicamente"). That burns a whole
+    # account slot and can't feed a general themed clip account, so it's DERANKED (composite ×
+    # dedicated_page_penalty), NOT excluded. English + Spanish/Portuguese; FAILS OPEN (a campaign
+    # usable from an account I already run is untouched). extract.detect_dedicated_page.
+    dedicated_page_enabled: bool = True
+    dedicated_page_penalty: float = 0.4      # composite × this when a dedicated page is required
+
+    # HIGH VIEW-MINIMUM-FOR-PAYOUT trap — a hard per-clip VIEW count required before ANY payout
+    # ("must hit 10K views for a payout", "$4 mínimo (10.000 visualizaciones)"). DISTINCT from the
+    # min-payout-DOLLAR gate; it feeds scoring.min_view_threshold_factor, which scales the penalty
+    # hard with the count (~0.25x at 5K, ~0.12x at 10K). view_minimum_trap_threshold is the
+    # reference point at/above which the trap is considered SEVERE (surfaced in the report).
+    # Detection (extract.parse_min_view_threshold) is English + Spanish/Portuguese; fail-open.
+    view_minimum_trap_threshold: float = 5000.0
+
+    # MEMBER-GATED / incomplete rules FLAG (not a derank) — some campaigns keep the real rules
+    # behind joining ("full guidelines on the sidebar after you join", "reglas completas después
+    # de unirte"), so Scout only sees PARTIAL rules. Flagged (rules_incomplete) in the report so I
+    # know not to fully trust the captured rules. English + Spanish; extract.detect_rules_incomplete.
+    rules_incomplete_flag_enabled: bool = True
 
     # SELF-SOURCED footage derank — some campaigns PROVIDE no footage; their rules/docs tell
     # clippers to find their OWN ("find your own footage", "use any footage of X", "we don't
@@ -796,6 +822,11 @@ _ANALYSIS_DEFAULTS = {
     # (True/False/None) + the matched phrase + the resolved factor composite_score multiplies in.
     "rules_doc_text": None, "self_sourced": None, "self_sourced_phrase": None,
     "self_sourced_factor": 1.0,
+    # DEDICATED-PAGE required derank (page/account usable ONLY for this campaign — an account-slot
+    # cost) + MEMBER-GATED rules FLAG (the full rules live behind joining, so captured rules are
+    # partial). Both English + Spanish; the dedicated-page factor composite_score multiplies in.
+    "dedicated_page_required": False, "dedicated_page_phrase": None, "dedicated_page_factor": 1.0,
+    "rules_incomplete": False, "rules_incomplete_phrase": None,
     # Prohibited/vice category exclusion (gambling/betting/casino/alcohol/vape/…). Like
     # rules_unreadable, excluded_prohibited=True REMOVES the campaign from the ranked output
     # the clipper reads (kept in campaigns.json, segregated in the report with the reason);
@@ -913,12 +944,37 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["min_views_to_payout"] = mv
     rec["high_minimum"] = mv is not None and mv > cfg.min_payout_max_views
 
+    # Full rules-text bundle for the trap detectors (min-view gate, dedicated-page, member-gated,
+    # self-sourced). Combines every rules body we've captured — bullets, modal requirements, the
+    # substantive modal rules section, and any fetched Notion/Google-Doc text — so a trap that
+    # lives only in the modal body (or in Spanish) is still seen. Used by several checks below.
+    rules_bundle = " ".join(t for t in (
+        rules, rec.get("modal_requirements_text"), rec.get("modal_rules_text"),
+        rec.get("notion_rules_text"), rec.get("rules_doc_text")) if t)
+
     # minimum-VIEW payout gate (DISTINCT from the min-payout-DOLLAR above): some campaigns pay
-    # $0 until a single video crosses a hard VIEW count ("VIDEO MUST REACH 10K FOR PAYOUT").
-    # Brutal for a new/low-view account, so it feeds a strong composite penalty scaling with
-    # the threshold. Reads the on-modal requirements text as well as the rules bullets.
-    mv_text = " ".join(t for t in (rules, rec.get("modal_requirements_text")) if t)
+    # $0 until a single video crosses a hard VIEW count ("VIDEO MUST REACH 10K FOR PAYOUT",
+    # Spanish "$4 mínimo (10.000 visualizaciones)"). Brutal for a new/low-view account, so it
+    # feeds a strong composite penalty scaling with the threshold. Reads the full rules bundle.
+    mv_text = rules_bundle
     rec["min_view_threshold"] = extract.parse_min_view_threshold(mv_text)
+
+    # DEDICATED-PAGE / account requirement — the rules demand a page used ONLY for this campaign's
+    # content ("página dedicada únicamente al contenido de X"), which burns a whole account slot.
+    # DERANKED (composite × cfg.dedicated_page_penalty), not excluded. English + Spanish; fail-open.
+    dp_phrase = (extract.detect_dedicated_page(rules_bundle)
+                 if getattr(cfg, "dedicated_page_enabled", True) else None)
+    rec["dedicated_page_required"] = bool(dp_phrase)
+    rec["dedicated_page_phrase"] = dp_phrase
+    rec["dedicated_page_factor"] = cfg.dedicated_page_penalty if dp_phrase else 1.0
+
+    # MEMBER-GATED / incomplete rules — the full guidelines live behind joining ("check full
+    # guidelines on the sidebar after you join"), so the captured rules are only PARTIAL. This is
+    # a FLAG (not a derank) so I know not to fully trust them. English + Spanish; fail-open.
+    ri_phrase = (extract.detect_rules_incomplete(rules_bundle)
+                 if getattr(cfg, "rules_incomplete_flag_enabled", True) else None)
+    rec["rules_incomplete"] = bool(ri_phrase)
+    rec["rules_incomplete_phrase"] = ri_phrase
 
     # resource-capture reliability: if the modal TEXT references a linked Doc/Drive/Notion/
     # folder but resource_links came back EMPTY, a doc was silently missed. Flag it (DETECTION
@@ -989,12 +1045,16 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     # just multiplies it in.
     appr = rec.get("approval_rate")
     if not isinstance(appr, (int, float)) or isinstance(appr, bool):
-        appr = extract.parse_approval_rate(
-            " ".join(t for t in (rec.get("modal_requirements_text"), rec.get("rules_text")) if t))
+        appr = extract.parse_approval_rate(rules_bundle)
         rec["approval_rate"] = appr
-    known_low = (cfg.approval_derank_enabled and isinstance(appr, (int, float))
-                 and not isinstance(appr, bool) and appr < cfg.approval_rate_floor)
-    rec["approval_rate_factor"] = cfg.approval_low_penalty if known_low else 1.0
+    if cfg.approval_derank_enabled:
+        # Penalty SCALES with how low the rate is: mild near the floor, a near-exclusion (~0.05)
+        # for a very-low rate (Michael Sartain's 6%). UNKNOWN / at-or-above floor -> 1.0.
+        rec["approval_rate_factor"] = scoring.approval_rate_scaled(
+            appr, floor=cfg.approval_rate_floor, mild=cfg.approval_mild_penalty,
+            severe_at=cfg.approval_severe_threshold, severe=cfg.approval_severe_penalty)
+    else:
+        rec["approval_rate_factor"] = 1.0
 
     # SELF-SOURCED footage — does the rules text tell clippers to find their OWN footage (campaign
     # provides none)? Un-clippable by a footage-download pipeline, so DERANKED (not excluded).

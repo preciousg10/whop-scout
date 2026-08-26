@@ -250,6 +250,17 @@ def _warning_flags(c):
         ph = c.get("self_sourced_phrase")
         ph_txt = f": \"{ph}\"" if ph else ""
         flags.append(f"SELF-SOURCED (no footage provided){fac_txt}{ph_txt}")
+    if c.get("dedicated_page_required"):
+        fac = b.get("dedicated_page_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        ph = c.get("dedicated_page_phrase")
+        ph_txt = f": \"{ph}\"" if ph else ""
+        flags.append(f"DEDICATED-PAGE required{fac_txt}{ph_txt}")
+    if c.get("rules_incomplete"):
+        ph = c.get("rules_incomplete_phrase")
+        ph_txt = f": \"{ph}\"" if ph else ""
+        flags.append(f"RULES-INCOMPLETE (full rules gated behind joining — captured rules "
+                     f"are partial){ph_txt}")
     return flags
 
 
