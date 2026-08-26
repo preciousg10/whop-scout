@@ -108,7 +108,8 @@ class Config:
     category_cache_path: str = "category_cache.json"  # per-content cache (skip Groq if unchanged)
     category_batch_size: int = 20             # campaigns per Groq call (70B handles 20; a 413
     #                                           auto-splits the batch — set ~10 for a static safety)
-    category_model: str = None                # None -> $GROQ_MODEL or llama-3.3-70b-versatile
+    category_model: str = None                # None -> $SCOUT_GROQ_MODEL or llama-3.3-70b-versatile
+    #                                           (NOT the clipper's $GROQ_MODEL — that's its own model)
     category_batch_pause: float = 2.0         # seconds between Groq batches (stay under RPM)
     category_batch_retries: int = 1           # whole-batch retries before fallback (daily budget: fail fast)
     # Per-run cap on NEW (uncached) campaigns sent to Groq — protects the free-tier DAILY token

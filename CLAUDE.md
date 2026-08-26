@@ -255,10 +255,17 @@ few, **titles as TEXT — never downloading video**), and creator (tiebreaker) �
 gaming/music/brand_product/meme/news/movie_tv/other), optional `secondary_categories`, and a
 `category_confidence` (high/low). Guards: the model may ONLY pick from the fixed list (anything
 else → "other"); insufficient/conflicting signals → "other"/low, never a guessed label. The model
-is `llama-3.3-70b-versatile` (override via `cfg.category_model` / `$GROQ_MODEL`) — its large context
-handles the 20-campaign batches; the small 8B-instant was tried but 413'd ("request too large") on
-those batches, and the daily-token budget is handled by the cap+cache below, not by shrinking the
-model. **Free-tier DAILY-budget discipline** (the whole point — categorizing all ~450 at once blew
+is `openai/gpt-oss-120b` (`GROQ_MODEL_DEFAULT`; override via `cfg.category_model` / a
+SCOUT-specific `$SCOUT_GROQ_MODEL`) — a large-context 120B model that handles the 20-campaign
+batches; the small 8B-instant was tried but 413'd ("request too large") on those batches, and the
+daily-token budget is handled by the cap+cache below, not by shrinking the model. The original
+70B pick `llama-3.3-70b-versatile` was **decommissioned by Groq** (its `models.list` no longer
+offers it — a call 404s "model does not exist or you do not have access to it"), so the default
+moved to the 120B model the sibling clipper already runs on the same keys. NOTE: scout does NOT
+inherit the clipper's bare `$GROQ_MODEL` (that's the clipper's own model, currently
+`openai/gpt-oss-120b`) — categorization resolves `cfg.category_model` → `$SCOUT_GROQ_MODEL` →
+`GROQ_MODEL_DEFAULT`, so the clipper's env can't silently swap scout's categorizer model.
+**Free-tier DAILY-budget discipline** (the whole point — categorizing all ~450 at once blew
 the quota): calls are BATCHED (`cfg.category_batch_size`, default 20 — a 413 on any batch
 auto-splits it in half via `_categorize_chunk` until it fits, so residual oversize never fails a
 whole chunk); results are CACHED by a hash of each campaign's CONTENT (`cfg.category_cache_path`)
@@ -274,8 +281,16 @@ into a dead daily quota only hangs the run; per-minute limits get a few short ho
 fresh pass but is STILL quota-capped. The pass runs AFTER intake (so footage titles exist), prints
 a 20-campaign sample + a per-source count line (groq/cache/keyword_fallback + fallback%), and
 returns a breakdown (per-category counts, low-confidence total, how far "other" shrank vs the
-keyword tagger) shown in the report. It **degrades to the keyword tagger** when Groq is
-unavailable (no `GROQ_API_KEY` / no `groq` package / `SCOUT_OFFLINE=1`), marked `category_source`
+keyword tagger) shown in the report. **API keys + rotation:** keys are read as the NUMBERED
+`GROQ_API_KEY_1..N` (the clipper's convention — the shared free-tier keys, rotated on limits;
+`categorize.groq_keys()` also accepts a bare `GROQ_API_KEY` if set). A `_GroqPool` rotates across
+them: a per-minute (TPM/RPM) limit on a key → rotate to the next key (cheaper than waiting); a
+DAILY (TPD/RPD) cap → RETIRE that key for the run and rotate; keyword fallback fires ONLY when
+EVERY key is exhausted (`GroqDailyLimit` is raised only once all keys are retired). (The original
+bug: the categorizer read only the bare `GROQ_API_KEY`, which isn't set — only the numbered ones
+are — so it wrongly reported "Groq unavailable" and keyword-fell-back everything.) It **degrades
+to the keyword tagger** when Groq is genuinely unavailable (no key at all / no `groq` package /
+`SCOUT_OFFLINE=1` — `_unavailable_reason()` says which), marked `category_source`
 = groq|cache|keyword_fallback — a run never depends on the model. Pure helpers (`campaign_signals`,
 `content_hash`, `build_batch_prompt`, `parse_batch_response`, `validate_result`, `keyword_result`)
 are network-free/testable.
@@ -430,8 +445,9 @@ Key module responsibilities:
   downloadable footage link EXIST at all?", distinct from accessibility/liveness; see the
   "No-public-footage derank" note above. Also a standalone CLI: `python intake.py <source_url> ...`.
 - **`categorize.py`** — Groq campaign categorizer (see the "Categorization" note above). Mirrors
-  the sibling clipper's Groq client (SDK + rate-limit backoff) on `llama-3.3-70b-versatile` and
-  hardened for the free-tier DAILY budget (cache always kept, per-run cap on new campaigns,
+  the sibling clipper's Groq client (SDK + rate-limit backoff) on `openai/gpt-oss-120b`, reading
+  the numbered `GROQ_API_KEY_1..N` and rotating across them (`_GroqPool`), and hardened for the
+  free-tier DAILY budget (cache always kept, per-run cap on new campaigns, all-keys-exhausted
   daily-limit detection that stops calling Groq, and 413 batch auto-splitting). Pure
   signal/hash/prompt/parse/validate
   helpers are network-free; the orchestration batches, caches by content hash, prints a sample, and
@@ -674,8 +690,9 @@ mounted behind it). So Phase 2 (`open_detail` → `extract_detail(dialog)` →
 `whop_profile/` holds the live logged-in session — treat it like a credential. Runtime
 outputs (`campaigns.json`, `campaigns_summary.md`, `campaign_template.json`,
 `proven_clips_result.json`, `proven_clips_cache.json`, `category_cache.json`, `liveness_cache.json`,
-`state.json`, `errors.log`, `probe_*`) are gitignored. Categorization needs `GROQ_API_KEY` in the env and
-the `groq` package (in requirements.txt); without them it degrades to the keyword tagger.
+`state.json`, `errors.log`, `probe_*`) are gitignored. Categorization needs at least one Groq key
+in the env — the numbered `GROQ_API_KEY_1..N` (or a bare `GROQ_API_KEY`) — and the `groq` package
+(in requirements.txt); without them it degrades to the keyword tagger.
 `clip_farms.json` and `my_performance.json` are optional user-maintained input (my own
 recorded results — personal ground truth), not scout outputs; scout never writes them.
 `completed_campaigns.json` (the DONE list) is clipper/user-maintained state — scout reads it

@@ -48,12 +48,16 @@ CATEGORIES = [
 ]
 _CATEGORY_SET = set(CATEGORIES)
 
-# 70B handles the 20-campaign batches fine (large context). The small 8B-instant was tried but
-# its context window is too small for 20-campaign batches — it 413'd ("request too large"). The
-# daily-TOKEN budget is already handled by the per-run cap + cache (not by shrinking the model),
-# so we stay on 70B. Override with cfg.category_model or $GROQ_MODEL if needed. (A residual 413 on
-# any batch is handled adaptively by splitting the batch — see _categorize_chunk.)
-GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
+# Categorization needs a LARGE-context model so a 20-campaign batch doesn't 413 ("request too
+# large" — what killed the old 8B-instant). The original 70B pick, llama-3.3-70b-versatile, has
+# since been DECOMMISSIONED by Groq (its models.list no longer offers it — a call 404s with
+# "model does not exist or you do not have access to it"), so we default to openai/gpt-oss-120b:
+# it's a currently-available 120B model (bigger context than the old 70B, so even safer against
+# 413), and it's the model the sibling clipper already runs on these same keys. The daily-TOKEN
+# budget is handled by the per-run cap + cache (not by shrinking the model). Override with
+# cfg.category_model or $SCOUT_GROQ_MODEL (NOT the clipper's $GROQ_MODEL). A residual 413 on any
+# batch is handled adaptively by splitting the batch — see _categorize_chunk.
+GROQ_MODEL_DEFAULT = "openai/gpt-oss-120b"
 # Recorded in the cache for provenance only. We do NOT discard the cache on a version change —
 # re-categorizing all ~450 campaigns every run is what blew the free-tier DAILY token budget.
 # Cached categorizations are always kept; only UNCACHED campaigns are sent to Groq. To force a
@@ -226,8 +230,32 @@ def parse_batch_response(raw, n):
 # =============================================================================
 # Groq client + batching (network) — mirrors the sibling clipper's groq_chat
 # =============================================================================
+def groq_keys():
+    """Every Groq API key set in the environment, in rotation order. The keys are the NUMBERED
+    GROQ_API_KEY_1, GROQ_API_KEY_2, … (the clipper's convention — the shared free-tier keys
+    rotated on rate-limit), plus a bare GROQ_API_KEY if one is also set. Deduped, order
+    preserved. Empty list ⇒ no key configured. This is why the categorizer used to think Groq
+    was 'unavailable': it read ONLY the bare GROQ_API_KEY, which isn't set — only the numbered
+    ones are."""
+    keys, seen = [], set()
+    # numbered keys, ascending (GROQ_API_KEY_1..N); scan a generous range then any stragglers
+    numbered = []
+    for name, val in os.environ.items():
+        m = re.fullmatch(r"GROQ_API_KEY_(\d+)", name)
+        if m and val and val.strip():
+            numbered.append((int(m.group(1)), val.strip()))
+    for _n, val in sorted(numbered, key=lambda kv: kv[0]):
+        if val not in seen:
+            seen.add(val)
+            keys.append(val)
+    bare = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if bare and bare not in seen:
+        keys.append(bare)
+    return keys
+
+
 def groq_available():
-    if os.environ.get("SCOUT_OFFLINE") == "1" or not os.environ.get("GROQ_API_KEY"):
+    if os.environ.get("SCOUT_OFFLINE") == "1" or not groq_keys():
         return False
     try:
         import groq  # noqa: F401
@@ -236,12 +264,72 @@ def groq_available():
     return True
 
 
+def _unavailable_reason():
+    """A precise reason Groq is unavailable — distinguishes the three causes the old
+    'no key/package/offline' message lumped together, so a run tells you WHICH to fix."""
+    if os.environ.get("SCOUT_OFFLINE") == "1":
+        return "SCOUT_OFFLINE=1"
+    if not groq_keys():
+        return "no API key (set GROQ_API_KEY_1..N or GROQ_API_KEY)"
+    try:
+        import groq  # noqa: F401
+    except Exception:
+        return "`groq` package not installed in this venv (pip install groq)"
+    return "client init failed"
+
+
+class _GroqPool:
+    """A rotating pool of Groq clients over the configured keys. One exhausted key must not sink
+    the run, so on a per-minute limit we rotate to the next key (cheaper than waiting) and on a
+    DAILY cap we retire that key for the rest of the run and rotate. Only when EVERY key is
+    retired do we treat the whole daily budget as gone. `current()` always points at a LIVE
+    (non-retired) key; clients are created lazily and reused. Never raises on construction."""
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self._live = list(range(len(self._keys)))   # original indices still usable this run
+        self._clients = {}                           # idx -> Groq client (lazy)
+        self._pos = 0                                # position within _live
+
+    def _client_for(self, idx):
+        c = self._clients.get(idx)
+        if c is None:
+            from groq import Groq
+            c = Groq(api_key=self._keys[idx])
+            self._clients[idx] = c
+        return c
+
+    def key_count(self):
+        return len(self._keys)
+
+    def live_count(self):
+        return len(self._live)
+
+    def current(self):
+        """(original_index, client) for the current live key, or (None, None) if all retired."""
+        if not self._live:
+            return None, None
+        self._pos %= len(self._live)
+        idx = self._live[self._pos]
+        return idx, self._client_for(idx)
+
+    def rotate(self):
+        if self._live:
+            self._pos = (self._pos + 1) % len(self._live)
+
+    def retire(self, idx):
+        """Drop a key that hit its DAILY cap; keep the cursor on a still-live key."""
+        if idx in self._live:
+            self._live.remove(idx)
+        if self._live:
+            self._pos %= len(self._live)
+
+
 def _groq_client():
+    """A rotating pool over ALL configured keys, or None if Groq is unavailable."""
     if not groq_available():
         return None
     try:
-        from groq import Groq
-        return Groq(api_key=os.environ["GROQ_API_KEY"])
+        return _GroqPool(groq_keys())
     except Exception:
         return None
 
@@ -298,13 +386,22 @@ def _classify_rate_limit(msg):
     return ("daily" if is_daily else "minute"), wait
 
 
-def _groq_chat(client, system, user, model, *, retries=3, max_tokens=2048):
-    """One chat completion. A per-minute rate limit (TPM/RPM) is transient: honor Groq's
-    'try again in Xs' hint (short), retry a FEW times, else fall back. A DAILY limit
-    (TPD/RPD, or a very long wait) raises GroqDailyLimit immediately — retrying into a dead
-    daily quota only hangs the run. Returns the message string, or None on other failure /
-    exhausted retries. Retries are deliberately modest (a daily budget, not a per-minute one)."""
-    for attempt in range(retries + 1):
+def _groq_chat(pool, system, user, model, *, retries=3, max_tokens=2048):
+    """One chat completion, ROTATING across the pool's keys. `pool` is a `_GroqPool`.
+    A per-minute rate limit (TPM/RPM) on a key with siblings → rotate to the next key
+    immediately (cheaper than waiting); with only ONE live key left, honor Groq's short
+    'try again in Xs' hint a FEW times. A DAILY cap (TPD/RPD, or a very long wait) RETIRES that
+    key for the run and rotates; only when EVERY key is retired do we raise GroqDailyLimit (the
+    whole daily budget is gone — the caller then stops calling Groq). A 413 raises
+    RequestTooLarge (the caller splits the batch). Returns the message string, or None on a
+    transient/other failure across the live keys (that batch defers to keyword)."""
+    minute_waits = 0
+    # Bound total tries: one pass over the live keys, plus a few single-key minute honors.
+    max_tries = pool.live_count() + retries + 1
+    for _ in range(max_tries):
+        idx, client = pool.current()
+        if client is None:                          # no live keys remain
+            break
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -321,15 +418,28 @@ def _groq_chat(client, system, user, model, *, retries=3, max_tokens=2048):
                 raise RequestTooLarge(msg.splitlines()[0][:200])
             kind, wait = _classify_rate_limit(msg)
             if kind == "daily":
-                raise GroqDailyLimit(msg.splitlines()[0][:200])
-            if kind == "minute" and attempt < retries:
-                w = (wait + 0.5) if wait else min(2.0 ** attempt, 20.0) + random.uniform(0, 1.0)
-                print(f"    Groq per-minute limit — waiting {w:.1f}s "
-                      f"(attempt {attempt + 1}/{retries})…")
-                time.sleep(w)
+                print(f"    Groq key #{idx + 1} daily cap reached — retiring it, rotating.")
+                pool.retire(idx)
                 continue
-            print(f"    Groq call failed ({model}): {msg.splitlines()[0][:160]}")
-            return None
+            if kind == "minute":
+                if pool.live_count() > 1:           # rotate instead of waiting
+                    print(f"    Groq key #{idx + 1} per-minute limit — rotating to next key.")
+                    pool.rotate()
+                    continue
+                if minute_waits < retries:          # single live key: honor a short wait
+                    w = (wait + 0.5) if wait else min(2.0 ** minute_waits, 20.0) + random.uniform(0, 1.0)
+                    print(f"    Groq per-minute limit (single live key) — waiting {w:.1f}s "
+                          f"(retry {minute_waits + 1}/{retries})…")
+                    time.sleep(w)
+                    minute_waits += 1
+                    continue
+                return None
+            # non-rate error (bad key, transient network, etc.) — try the next key
+            print(f"    Groq key #{idx + 1} call failed ({model}): {msg.splitlines()[0][:140]}")
+            pool.rotate()
+            continue
+    if pool.live_count() == 0:                       # every key hit its daily cap this run
+        raise GroqDailyLimit("all Groq keys reached their daily cap")
     return None
 
 
@@ -480,8 +590,14 @@ def categorize_campaigns(records, cfg, *, recategorize=False, client=None, sampl
         return summarize(active)
 
     path = getattr(cfg, "category_cache_path", "category_cache.json")
-    model = getattr(cfg, "category_model", None) or os.environ.get("GROQ_MODEL",
-                                                                    GROQ_MODEL_DEFAULT)
+    # Model resolution: cfg override → a SCOUT-SPECIFIC env override → the 70B default. We do NOT
+    # inherit the bare $GROQ_MODEL here: that variable is the sibling CLIPPER's model (currently
+    # openai/gpt-oss-120b) and letting it leak in would silently run categorization on the wrong
+    # model. Categorization needs llama-3.3-70b-versatile (the 8B 413'd on 20-campaign batches);
+    # use SCOUT_GROQ_MODEL only if you deliberately want to override scout's categorizer.
+    model = (getattr(cfg, "category_model", None)
+             or os.environ.get("SCOUT_GROQ_MODEL")
+             or GROQ_MODEL_DEFAULT)
     cache = {} if recategorize else _load_cache(path)
     if recategorize:
         print("  Categorizer: --recategorize — clearing cache, fresh Groq pass.")
@@ -502,9 +618,9 @@ def categorize_campaigns(records, cfg, *, recategorize=False, client=None, sampl
     if todo:
         client = client if client is not None else _groq_client()
         if client is None:
-            print("  Categorizer: Groq unavailable (no key/package/offline) — keyword "
-                  f"fallback for {len(todo)} campaign(s). Set GROQ_API_KEY + "
-                  "`pip install groq` for real categorization.")
+            reason = _unavailable_reason()
+            print(f"  Categorizer: Groq unavailable ({reason}) — keyword fallback for "
+                  f"{len(todo)} campaign(s).")
             for r, _sig, _h in todo:
                 _apply(r, keyword_result(r), source="keyword_fallback")
         else:
@@ -512,6 +628,8 @@ def categorize_campaigns(records, cfg, *, recategorize=False, client=None, sampl
             # can't exceed the free-tier DAILY budget. The rest keep keyword_fallback (NOT
             # cached) and are picked up on the next run — Scout runs every few days, so the
             # board fills in over a couple runs without ever blowing the quota.
+            keyc = client.key_count() if hasattr(client, "key_count") else 1
+            print(f"  Categorizer: Groq ready — {keyc} key(s) rotating, model {model}.")
             cap = getattr(cfg, "category_max_new_per_run", 120)
             to_groq, over_cap = todo, []
             if cap and cap > 0 and len(todo) > cap:
