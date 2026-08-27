@@ -1179,10 +1179,86 @@ def _click_with_retry(locator, cfg, pacer, *, hover=None):
     raise last
 
 
+def _visible_consent_overlay(scope):
+    """Return a VISIBLE consent-overlay locator in `scope` (top page or app FrameLocator), or
+    None. Cheap: count() short-circuits before the visibility probe, so an absent dialog costs
+    only a few count() calls. Never raises."""
+    if scope is None:
+        return None
+    for sel in S.CONSENT_OVERLAY:
+        try:
+            loc = scope.locator(sel).first
+            if loc.count() > 0 and loc.is_visible(timeout=500):
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def _click_consent_accept(scopes, cfg):
+    """Click an affirmative accept/dismiss control inside the consent dialog, scoped to the
+    dialog CONTENT container (never page-wide, so we can't fire an unrelated 'Accept'). Returns
+    True on a click. StopRun is never swallowed."""
+    for scope in scopes:
+        containers = []
+        for csel in S.CONSENT_CONTENT:
+            try:
+                c = scope.locator(csel).first
+                if c.count() > 0:
+                    containers.append(c)
+            except Exception:
+                continue
+        for container in containers:
+            for sel in S.CONSENT_ACCEPT:
+                try:
+                    btn = container.locator(sel).first
+                    if btn.count() > 0 and btn.is_visible(timeout=500):
+                        btn.click(timeout=cfg.click_timeout_ms)
+                        return True
+                except StopRun:
+                    raise
+                except Exception:
+                    continue
+    return False
+
+
+def dismiss_consent_dialog(page, fl, cfg):
+    """Detect and dismiss the Whop ToS/consent AlertDialog (Frosted-UI 'fui-AlertDialogOverlay')
+    that portals over the experience and intercepts pointer events, making EVERY card click fail.
+    Checks BOTH the top page and the app frame. Clicks an affirmative accept/dismiss control
+    (scoped to the dialog), else presses Escape, and waits for the overlay to detach. Returns
+    True if nothing was up or it was dismissed. **Fails loud** — raises StopRun — when the dialog
+    IS present but won't close, because a stuck consent wall makes every click impossible and
+    silently logging 548 failures is worse than stopping. Cheap + idempotent, so it's safe to
+    call before the detail pass AND before each card click (re-appearance is handled)."""
+    scopes = [s for s in (page, fl) if s is not None]
+    if not any(_visible_consent_overlay(s) is not None for s in scopes):
+        return True                                   # nothing up — the common path, cheap
+
+    print("  Consent/ToS dialog detected over the page — dismissing before continuing...")
+    for _ in range(3):
+        if not _click_consent_accept(scopes, cfg):    # no accept button found — try Escape
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        time.sleep(1.0)
+        if not any(_visible_consent_overlay(s) is not None for s in scopes):
+            print("  Consent dialog dismissed.")
+            return True
+
+    raise StopRun("a Whop consent/ToS dialog is blocking the page and could not be dismissed "
+                  "(no accept control found and Escape was ignored) — accept it manually in the "
+                  "browser, then re-run")
+
+
 def open_detail(page, fl, name, pacer, cfg):
     """Click the card for `name` and return its open dialog Locator. Retries slow clicks;
     raises a plain Exception on transient failure (caught + retried per-campaign) but StopRun
-    ONLY on a real block (challenge / login wall) so the run-ending tripwire stays specific."""
+    ONLY on a real block (challenge / login wall / an un-dismissable consent dialog) so the
+    run-ending tripwire stays specific."""
+    # A ToS/consent overlay can (re)appear at any point and eats the click — clear it first.
+    dismiss_consent_dialog(page, fl, cfg)
     btn = fl.get_by_role("button", name=f"View {name} campaign", exact=True).first
     try:
         btn.scroll_into_view_if_needed(timeout=cfg.scroll_into_view_ms)
@@ -1999,6 +2075,10 @@ def run_detail_pass(page, fl, survivors, prev_by_id, state, pacer, cfg, deadline
 
     # 2) UNREACHED campaigns — the ENTIRE session budget (max_campaigns / time) goes here,
     #    in list order, so successive runs keep filling the board where the last one stopped.
+    # A Whop ToS/consent AlertDialog can be portaled over the page and intercept every card
+    # click — dismiss it up front (fails loud if it's present but won't close) before the pass.
+    if to_scrape:
+        dismiss_consent_dialog(page, fl, cfg)
     consecutive_failures = 0
     processed = 0
     prev_name = None

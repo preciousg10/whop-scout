@@ -125,6 +125,51 @@ SOURCE_LINK_SELECTORS = [
     'a[href*="kick.com"]',
 ]
 
+# --- Consent / Terms-of-Service AlertDialog (blocks card clicks) --------------
+# Whop portals a Frosted-UI AlertDialog (a Terms-of-Service / consent wall) OVER the whole
+# experience: class "fui-DialogOverlay fui-AlertDialogOverlay", a React-portal id like "_r_2_"
+# (GENERATED — never match on it), containing a /tos link. Its overlay backdrop captures pointer
+# events, so EVERY card click lands on the overlay instead of the card and fails (the 548-failure
+# / 8-consecutive-stop symptom). scout.dismiss_consent_dialog detects these and clicks an
+# accept/continue control (or presses Escape) before the detail pass and defensively between
+# cards. It can render on the TOP page OR inside the app frame, so both scopes are checked.
+# Overlay/dialog MARKERS (presence) first; the CONTENT container and ACCEPT controls follow.
+CONSENT_OVERLAY = [
+    '.fui-AlertDialogOverlay',
+    '.fui-DialogOverlay',
+    '[role="alertdialog"]',
+    'div[class*="AlertDialogOverlay" i]',
+    'div[class*="DialogOverlay" i]',
+]
+# The dialog CONTENT panel (holds the buttons) — the overlay above is just the backdrop, so the
+# accept button is scoped to these, NOT to the overlay, and NOT to the whole page (a page-wide
+# "Accept" could be an unrelated control).
+CONSENT_CONTENT = [
+    '[role="alertdialog"]',
+    '.fui-AlertDialogContent',
+    '.fui-DialogContent',
+    'div[class*="AlertDialogContent" i]',
+    'div[class*="DialogContent" i]',
+]
+# The affirmative accept/dismiss control INSIDE the consent dialog. A ToS/consent AlertDialog is
+# dismissed by an affirmative button (Accept / Agree / Continue / …) or a close/dismiss control —
+# NOT by a Decline/Cancel (which could log out or navigate away), so those are deliberately
+# excluded; a genuinely un-acceptable dialog is failed loud instead. Tried in order.
+CONSENT_ACCEPT = [
+    'button:has-text("Accept")',
+    'button:has-text("I agree")',
+    'button:has-text("Agree")',
+    'button:has-text("Continue")',
+    'button:has-text("Got it")',
+    'button:has-text("I understand")',
+    'button:has-text("Acknowledge")',
+    'button:has-text("Confirm")',
+    'button:has-text("Okay")',
+    'button:has-text("OK")',
+    'button[aria-label*="close" i]',
+    'button[aria-label*="dismiss" i]',
+]
+
 # --- Blocker / challenge detection --------------------------------------------
 # Real captcha / bot-challenge surfaces only. Login-wall detection is separate
 # (URL + password field) so ordinary "Log in" links don't trip a false stop.

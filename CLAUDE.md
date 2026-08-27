@@ -673,6 +673,18 @@ mounted behind it). So Phase 2 (`open_detail` → `extract_detail(dialog)` →
   `StopRun` ONLY for a detected challenge/login wall; the scrape loop also re-checks
   `is_challenge`/`is_login_wall` on any error and runs `_recover_list` (dismiss a half-open
   dialog + confirm the feed is healthy) so one slow card can't cascade.
+- **Consent / ToS AlertDialog (`dismiss_consent_dialog`).** Whop sometimes portals a Frosted-UI
+  AlertDialog (a Terms-of-Service / consent wall — `.fui-AlertDialogOverlay`, a generated
+  `_r_*` portal id, a `/tos` link) OVER the experience; its backdrop captures pointer events so
+  EVERY card click lands on the overlay and fails (the "548 failures, immediate 8-consecutive
+  stop" symptom). `dismiss_consent_dialog(page, fl, cfg)` (selectors `CONSENT_OVERLAY` /
+  `CONSENT_CONTENT` / `CONSENT_ACCEPT`) detects it on BOTH the top page and the app frame,
+  clicks an affirmative accept/dismiss control scoped to the dialog (never a page-wide button,
+  and never a Decline/Cancel that could log out), else presses Escape, and waits for it to
+  detach. It runs once before the unreached-scrape loop AND inside `open_detail` before every
+  card click (so a re-appearance between cards is cleared). It's cheap/idempotent when nothing is
+  up (count() short-circuits), and **fails loud** — raises `StopRun` — when the dialog is present
+  but won't close, rather than silently logging thousands of intercepted-click failures.
 - Keep the once-daily (20h) guard and the 200-campaign / 90-minute session caps intact.
   These bound the **on-Whop scraping** session (politeness — "indistinguishable from me
   browsing my own account"). The **off-Whop analysis** phase (yt-dlp clipper discovery
