@@ -37,11 +37,14 @@ template/candidate-legitimacy/noise-filter — unit-testable with no network) fe
 off a yt-dlp harvest+discovery layer that never raises.
 """
 import copy
+import importlib.util
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import datetime, timezone
@@ -85,8 +88,30 @@ _NOISE_RE = re.compile(
 )
 
 
+# yt-dlp resolution — robust across launch methods (see intake._resolve_ytdlp_cmd for the full
+# rationale). shutil.which ONLY searches PATH, so launching Scout's venv python directly (without
+# activating) reported "yt-dlp not available" and SKIPPED proven-clips analysis even though the
+# venv had yt-dlp. We prefer the importable module so it always runs under Scout's own venv.
+def _resolve_ytdlp_cmd():
+    override = os.environ.get("SCOUT_YTDLP")
+    if override and (os.path.isfile(override) or shutil.which(override)):
+        return [override]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    bindir = os.path.dirname(sys.executable)
+    for name in ("yt-dlp.exe", "yt-dlp"):
+        cand = os.path.join(bindir, name)
+        if os.path.isfile(cand):
+            return [cand]
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    return [exe] if exe else None
+
+
+_YTDLP_CMD = _resolve_ytdlp_cmd()
+
+
 def yt_dlp_available():
-    return shutil.which("yt-dlp") is not None
+    return _YTDLP_CMD is not None
 
 
 # =============================================================================
@@ -530,7 +555,7 @@ def enrich_template_with_content(template, top_clips, *, download_dir=None):
 # =============================================================================
 def _run_ytdlp(args, timeout):
     try:
-        proc = subprocess.run(["yt-dlp", *args, "--skip-download"],
+        proc = subprocess.run([*_YTDLP_CMD, *args, "--skip-download"],
                               capture_output=True, text=True, timeout=timeout)
     except Exception:
         return None

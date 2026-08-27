@@ -28,10 +28,13 @@ Design rules (hard requirements):
     are not re-probed on the next run.
 """
 import html
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
 from datetime import datetime, timezone
@@ -49,8 +52,34 @@ CONTENT_TYPES = STANDARD_CONTENT_TYPES + (
 SHORT_VIDEO_SEC = 180.0   # a source whose videos are all shorter than this is "unusual"
 
 
+# yt-dlp resolution — robust across launch methods. `shutil.which("yt-dlp")` ONLY searches
+# PATH, so running `.venv\Scripts\python.exe scout.py` WITHOUT activating the venv (the normal
+# way Scout is launched) reports "not found" even though the venv HAS yt-dlp — the bug that
+# skipped footage probing. So we resolve in priority order and prefer the IMPORTABLE module,
+# which is guaranteed to run under Scout's own interpreter/venv:
+#   1. $SCOUT_YTDLP override (explicit full path)   2. the yt_dlp MODULE via `python -m yt_dlp`
+#   3. a yt-dlp exe next to this interpreter (venv Scripts/bin)   4. yt-dlp on PATH
+# Returns the base argv list to prepend to yt-dlp args, or None when genuinely unavailable.
+def _resolve_ytdlp_cmd():
+    override = os.environ.get("SCOUT_YTDLP")
+    if override and (os.path.isfile(override) or shutil.which(override)):
+        return [override]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    bindir = os.path.dirname(sys.executable)
+    for name in ("yt-dlp.exe", "yt-dlp"):
+        cand = os.path.join(bindir, name)
+        if os.path.isfile(cand):
+            return [cand]
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    return [exe] if exe else None
+
+
+_YTDLP_CMD = _resolve_ytdlp_cmd()
+
+
 def yt_dlp_available():
-    return shutil.which("yt-dlp") is not None
+    return _YTDLP_CMD is not None
 
 
 # =============================================================================
@@ -437,7 +466,7 @@ def probe_source(url):
 # =============================================================================
 def _ytdlp_json(url, timeout=90):
     try:
-        proc = subprocess.run(["yt-dlp", "--dump-json", "--no-warnings",
+        proc = subprocess.run([*_YTDLP_CMD, "--dump-json", "--no-warnings",
                                "--skip-download", url],
                               capture_output=True, text=True, timeout=timeout)
     except Exception:
@@ -456,7 +485,7 @@ def _ytdlp_json(url, timeout=90):
 
 def _ytdlp_flat(url, limit=40, timeout=120):
     try:
-        proc = subprocess.run(["yt-dlp", "--dump-single-json", "--flat-playlist",
+        proc = subprocess.run([*_YTDLP_CMD, "--dump-single-json", "--flat-playlist",
                                "--playlist-end", str(limit), "--no-warnings",
                                "--skip-download", url],
                               capture_output=True, text=True, timeout=timeout)
@@ -493,11 +522,12 @@ def fetch_subtitles(url, cookies_from_browser=None, timeout=120):
         return None
     tmp = Path(tempfile.mkdtemp(prefix="scout_subs_"))
     try:
-        cmd = ["yt-dlp", "--skip-download", "--write-subs", "--write-auto-subs",
+        cmd = [*_YTDLP_CMD, "--skip-download", "--write-subs", "--write-auto-subs",
                "--sub-langs", "en.*", "--sub-format", "vtt/srt/best",
                "--no-warnings", "-o", str(tmp / "%(id)s.%(ext)s"), url]
         if cookies_from_browser:
-            cmd[1:1] = ["--cookies-from-browser", cookies_from_browser]
+            # insert AFTER the base argv (which may be `python -m yt_dlp`, not a single exe)
+            cmd[len(_YTDLP_CMD):len(_YTDLP_CMD)] = ["--cookies-from-browser", cookies_from_browser]
         try:
             subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         except Exception:

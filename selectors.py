@@ -74,7 +74,19 @@ DETAIL_DIALOG = ['[role="dialog"]', '.campaign-details-modal-bg']
 # The selectors below are RELATIVE TO THE DIALOG scope.
 DETAIL_NAME = ['h2']                       # visible title (sr-only h2 holds it too)
 DETAIL_CREATOR = ['span.truncate']         # "Creator Casino" in the header row
-DETAIL_APPROVAL_RATE = ['text=/[0-9]{1,3}\\s*%\\s*approval rate/i']  # "88% approval rate" (header)
+# Approval rate — renders as "NN% approval rate" in the header row, next to the creator name
+# ("<Creator> · 89% approval rate"). Tried in order; the dedicated element is preferred, then
+# broader containers, then a whole-header fallback — extract.parse_approval_rate pulls the first
+# "NN% approval rate" out of whatever text a candidate returns, so an over-broad match is safe.
+# extract_detail ALSO parses the full dialog innerText as a final fallback (the header line is
+# reliably present there even when these selectors miss), so approval is captured on every scrape.
+DETAIL_APPROVAL_RATE = [
+    'text=/[0-9]{1,3}\\s*%\\s*approval rate/i',       # the phrase itself (element or ancestor)
+    ':text-matches("[0-9]{1,3}\\\\s*%\\\\s*approval", "i")',
+    '[class*="approval" i]',                          # a class-named approval stat block
+    'span:has-text("approval rate")',                 # the header span carrying it
+    'div:has-text("approval rate")',                  # its container
+]
 DETAIL_PAY = ['text=/\\$[0-9.,]+\\s*\\/\\s*1?[kKmM]/']          # "$1/1K views"
 DETAIL_BUDGET_TOTAL = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']  # "$136,713/$250,000"
 DETAIL_BUDGET_REMAINING = ['text=/\\$[0-9,]+\\s*\\/\\s*\\$[0-9,]+/']

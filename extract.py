@@ -1149,9 +1149,14 @@ def extract_detail(scope):
     # not just the pointer. rules_text (the scoring input) is left as-is.
     modal_rules_text = full_modal_rules(dialog_text, rules)
 
-    # approval rate — the header "NN% approval rate". Try the dedicated element, then fall
-    # back to parsing the dialog text (the header rate is the first "NN% approval rate").
+    # approval rate — the header "NN% approval rate". Try the dedicated element(s) first, then
+    # fall back to the FULL dialog innerText (dialog_text), which reliably carries the header
+    # line even when the selectors miss — NOT the `rules` bullets, which are the requirement
+    # list and never contain the header. This is what makes approval capture reliable on every
+    # scrape (the header rate is the first "NN% approval rate" in the text). None -> UNKNOWN.
     approval_rate = parse_approval_rate(_text(scope, S.DETAIL_APPROVAL_RATE))
+    if approval_rate is None:
+        approval_rate = parse_approval_rate(dialog_text)
     if approval_rate is None:
         approval_rate = parse_approval_rate(rules)
 

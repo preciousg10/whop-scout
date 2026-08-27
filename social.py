@@ -21,10 +21,13 @@ Confidence per campaign:
   LOW     — a creator/handle is identified but no count could be retrieved.
   UNKNOWN — no identifiable source at all.
 """
+import importlib.util
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.request
 
 # yt-dlp handles these natively; the rest fall through to the HTTP fetch.
@@ -37,8 +40,29 @@ _COUNT_RE = re.compile(r"([0-9][0-9.,]*)\s*([KMB])?\b", re.I)
 _FOLLOWERS_RE = re.compile(r"([0-9][0-9.,]*\s*[KMB]?)\s+followers", re.I)
 
 
+# yt-dlp resolution — robust across launch methods (see intake._resolve_ytdlp_cmd). shutil.which
+# ONLY searches PATH, so launching Scout's venv python directly (not activated) reported "not
+# found" and skipped the follower/traction lookup though the venv had yt-dlp. Prefer the module.
+def _resolve_ytdlp_cmd():
+    override = os.environ.get("SCOUT_YTDLP")
+    if override and (os.path.isfile(override) or shutil.which(override)):
+        return [override]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    bindir = os.path.dirname(sys.executable)
+    for name in ("yt-dlp.exe", "yt-dlp"):
+        cand = os.path.join(bindir, name)
+        if os.path.isfile(cand):
+            return [cand]
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    return [exe] if exe else None
+
+
+_YTDLP_CMD = _resolve_ytdlp_cmd()
+
+
 def yt_dlp_available():
-    return shutil.which("yt-dlp") is not None
+    return _YTDLP_CMD is not None
 
 
 def parse_count(text):
@@ -62,7 +86,7 @@ def _ytdlp_json(url, timeout):
     """Single-JSON metadata dump for a profile/channel, or None on any problem."""
     try:
         proc = subprocess.run(
-            ["yt-dlp", "--dump-single-json", "--flat-playlist",
+            [*_YTDLP_CMD, "--dump-single-json", "--flat-playlist",
              "--playlist-end", "10", "--skip-download", url],
             capture_output=True, text=True, timeout=timeout,
         )

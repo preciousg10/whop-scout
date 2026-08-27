@@ -5,15 +5,39 @@ inspected with `yt-dlp --dump-json --flat-playlist --skip-download` to collect a
 rough video count, total duration, and recent upload dates. Everything is
 best-effort: missing yt-dlp or a failed probe yields None, never a crash.
 """
+import importlib.util
 import json
+import os
 import shutil
 import subprocess
+import sys
 
 from extract import CHANNEL_HOSTS
 
 
+# yt-dlp resolution — robust across launch methods (see intake._resolve_ytdlp_cmd). shutil.which
+# ONLY searches PATH, so launching Scout's venv python directly (not activated) reported "not
+# found" and skipped the footage probe though the venv had yt-dlp. Prefer the importable module.
+def _resolve_ytdlp_cmd():
+    override = os.environ.get("SCOUT_YTDLP")
+    if override and (os.path.isfile(override) or shutil.which(override)):
+        return [override]
+    if importlib.util.find_spec("yt_dlp") is not None:
+        return [sys.executable, "-m", "yt_dlp"]
+    bindir = os.path.dirname(sys.executable)
+    for name in ("yt-dlp.exe", "yt-dlp"):
+        cand = os.path.join(bindir, name)
+        if os.path.isfile(cand):
+            return [cand]
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    return [exe] if exe else None
+
+
+_YTDLP_CMD = _resolve_ytdlp_cmd()
+
+
 def yt_dlp_available():
-    return shutil.which("yt-dlp") is not None
+    return _YTDLP_CMD is not None
 
 
 def _is_channel(url):
@@ -26,7 +50,7 @@ def probe_channel(url, timeout=90):
         return None
     try:
         proc = subprocess.run(
-            ["yt-dlp", "--dump-json", "--flat-playlist", "--skip-download", url],
+            [*_YTDLP_CMD, "--dump-json", "--flat-playlist", "--skip-download", url],
             capture_output=True,
             text=True,
             timeout=timeout,

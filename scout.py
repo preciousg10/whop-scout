@@ -112,10 +112,15 @@ class Config:
     #                                           (NOT the clipper's $GROQ_MODEL — that's its own model)
     category_batch_pause: float = 2.0         # seconds between Groq batches (stay under RPM)
     category_batch_retries: int = 1           # whole-batch retries before fallback (daily budget: fail fast)
-    # Per-run cap on NEW (uncached) campaigns sent to Groq — protects the free-tier DAILY token
-    # budget on a first big fill. The rest keep keyword_fallback and are picked up next run;
-    # Scout runs every few days, so the board fills in over a couple runs within the free tier.
-    category_max_new_per_run: int = 120
+    # Per-run cap on NEW (uncached) campaigns sent to Groq. Raised from 120 -> 500 so a typical
+    # full board (~450) is Groq-categorized in ONE run instead of 74% keyword-guessed and drip-fed
+    # over many runs — category filtering (e.g. "podcast") is only reliable once most campaigns are
+    # Groq-categorized, not keyword-tagged. We rotate across the 4 numbered GROQ_API_KEY_1..N, so
+    # the effective per-run token budget is ~4x a single key; the content-hash cache means each
+    # campaign is sent to Groq ONCE (ever), so subsequent runs categorize only genuinely-new
+    # campaigns and cost almost nothing. Any residual over-cap still keeps keyword_fallback and is
+    # picked up next run; a hard DAILY-limit on every key still stops calls cleanly mid-run.
+    category_max_new_per_run: int = 500
 
     # proven-clips / repeatable-clippability (the heavy new ranking lever).
     # Clippability is measured from AUTO-DISCOVERED dedicated clipper accounts of each
@@ -154,12 +159,14 @@ class Config:
     # deprioritized hard — a normal ~1k-view clip would earn nothing.
     min_payout_max_views: float = 1000.0
 
-    # Non-English derank (English-only operation). A campaign whose text (name + rules +
-    # modal + creator handle/description) reads as CLEARLY non-English gets its composite
-    # multiplied by this — a heavy derank (~85% off), NOT a hard exclude. Detection is a
-    # cheap offline stopword heuristic (language.py, NO Groq); ambiguous/short text fails
-    # OPEN (factor 1.0), so English composites are left EXACTLY unchanged.
-    nonenglish_penalty: float = 0.15
+    # Non-English derank (English-only operation). A campaign whose text (name + EVERY captured
+    # rules body + creator handle/description) reads as CLEARLY non-English gets its composite
+    # multiplied by this — a NEAR-EXCLUSION (~95% off, tightened from 0.15) so it effectively
+    # never reaches the top of a category. It is NOT a hard exclude on Scout's side (kept visible
+    # but buried); the real gate is the top-level rec["non_english"] flag the CLIPPER reads to
+    # HARD-SKIP before downloading. Detection is a cheap offline stopword heuristic (language.py,
+    # NO Groq); ambiguous/short text fails OPEN (factor 1.0), so English composites are unchanged.
+    nonenglish_penalty: float = 0.05
 
     # PAYOUT-HEALTH derank (scoring.payout_health). Scout scores POTENTIAL (budget/CPM/reach)
     # but is otherwise blind to whether a campaign ACTUALLY pays. A paying-dead trap — open a
@@ -780,6 +787,9 @@ _ANALYSIS_DEFAULTS = {
     "join_cta": None, "open_to_all": "unclear",
     "disqualifiers": [], "disqualified": False,
     "first_seen_at": None, "days_active": None, "payout_velocity": None,
+    # LANGUAGE — full detection dict in "language"; flat clipper-readable flags for a pre-download
+    # HARD-SKIP of non-English campaigns (non_english + language_code, e.g. 'es'). Fail-open.
+    "non_english": False, "language_code": "en",
     # PAYOUT HEALTH — is the campaign actually paying? submissions is the inline activity count
     # next to the budget; payout_health is the verdict (dead/healthy/new/ok/unknown) + the
     # resolved factor composite_score multiplies in. Fails open (unknown -> factor 1.0).
@@ -1023,6 +1033,16 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     # just multiplies it (English/unknown -> 1.0, leaving English composites EXACTLY unchanged).
     lang = language.detect_language(language.language_text(rec))
     rec["language"] = lang
+    # Top-level, clipper-readable flags so the CLIPPER's pick step can HARD-SKIP a non-English
+    # campaign BEFORE it wastes a download+transcribe (the NIVEL 0 case: 4.45h downloaded + a
+    # 162-min Spanish video transcribed before anything rejected it). These are the flat fields
+    # the clipper reads; the full detection dict stays in rec["language"]. Fail-open: short/
+    # ambiguous text -> non_english False, language_code "en".
+    rec["non_english"] = bool(lang.get("nonenglish"))
+    rec["language_code"] = lang.get("language") if lang.get("nonenglish") else "en"
+    # Derank is a NEAR-EXCLUSION (cfg.nonenglish_penalty, default 0.05) so a non-English campaign
+    # effectively never reaches the top of a category even if the clipper's skip is off — but the
+    # non_english flag above is the real gate (Scout keeps them visible-but-buried, clipper skips).
     rec["language_penalty_factor"] = cfg.nonenglish_penalty if lang.get("nonenglish") else 1.0
 
     # FOOTAGE PRESENCE — does the campaign expose a PUBLIC, downloadable footage link at all?
