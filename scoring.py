@@ -371,6 +371,18 @@ def dedicated_page_factor(dedicated_page_penalty_factor):
     return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
 
 
+def person_dedicated_factor(person_dedicated_penalty_factor):
+    """Person-name dedicated-account derank. The resolved factor is computed upstream
+    (enrich_active sets rec['person_dedicated_factor'] = cfg.person_dedicated_penalty when the
+    rules require the account/username be dedicated to a SPECIFIC NAMED PERSON, else 1.0), so this
+    just validates it: a positive number is used as-is, anything else -> neutral 1.0 (fail-open — a
+    generic CATEGORY dedication, or an ambiguous/absent one, is left EXACTLY unchanged). DISTINCT
+    from dedicated_page_factor (a page used ONLY for this campaign, whether or not it names a
+    person): forcing a fresh account per NAMED PERSON is the specific cost this penalizes."""
+    f = person_dedicated_penalty_factor
+    return f if isinstance(f, (int, float)) and not isinstance(f, bool) and f > 0 else 1.0
+
+
 def self_sourced_factor(self_sourced_penalty_factor):
     """Self-sourced-footage derank. The resolved factor is computed upstream (enrich_active /
     enrich_self_sourced_docs set rec['self_sourced_factor'] = cfg.self_sourced_penalty when the
@@ -553,14 +565,36 @@ def velocity_band(velocity, days_active):
 
 
 def velocity_factor(velocity, days_active):
-    """Old + creeping payout -> strong negative; fresh -> neutral 1.0.
-    velocity = paid_fraction / day. $200/$2,000 over 10 days (0.01/day) -> ~0.6 penalty."""
+    """Old + creeping payout -> STRONG negative; fresh -> neutral 1.0.
+
+    velocity = paid_fraction / day. FIX 2 weights this HARD: a campaign whose money isn't
+    actually moving must sink well below a proven steady payer even when its reach/budget look
+    great. The floor drops to ~0.12 (a near-dead campaign) and the curve is steeper — $200/$2,000
+    over 10 days (0.01/day) -> ~0.5, a barely-draining pool -> ~0.15. Fresh or UNKNOWN velocity is
+    never penalized (fail-open)."""
     if days_active is None or days_active < VELOCITY_MIN_AGE_DAYS or velocity is None:
         return 1.0  # fresh or unknown -> never penalized
-    if velocity < 0.003:
-        return 0.35
-    return round(_interp_log(velocity, [(0.003, 0.4), (0.005, 0.5), (0.01, 0.6),
-                                        (0.02, 0.85), (0.04, 1.05), (0.08, 1.2)]), 4)
+    if velocity <= 0.0005:
+        return 0.12
+    return round(_interp_log(velocity, [(0.0005, 0.12), (0.001, 0.18), (0.003, 0.3),
+                                        (0.005, 0.42), (0.01, 0.55), (0.02, 0.8),
+                                        (0.04, 1.05), (0.08, 1.2)]), 4)
+
+
+def budget_velocity_quality(velocity, days_active):
+    """Fraction (0..1) of the big-budget BOOST a campaign earns given how fast money is actually
+    MOVING (FIX 2: "don't reward a big remaining budget when money isn't actually moving"). The
+    budget lever hands huge pools up to ~2.6x on POTENTIAL alone; a dead/creeping campaign should
+    NOT collect that bonus just for sitting on an unspent pool. So the portion of budget_factor
+    ABOVE neutral 1.0 is scaled by this: near-zero velocity -> keep ~0.2 of the boost, a healthy
+    drain -> full boost. Only ever tempers the BOOST (never adds a second penalty below neutral),
+    and FAILS OPEN — fresh (< min age) or UNKNOWN velocity -> 1.0 (full boost, never guessed)."""
+    if days_active is None or days_active < VELOCITY_MIN_AGE_DAYS or velocity is None:
+        return 1.0
+    if velocity <= 0.0005:
+        return 0.2
+    return round(_interp_log(velocity, [(0.0005, 0.2), (0.002, 0.3), (0.005, 0.45),
+                                        (0.01, 0.6), (0.02, 0.82), (0.04, 1.0)]), 4)
 
 
 # --- competition per dollar ----------------------------------------------------
@@ -996,6 +1030,14 @@ def composite_score(c):
     vel_fac = velocity_factor(vel, days)
     vel_band = velocity_band(vel, days)
 
+    # FIX 2: don't reward a big remaining budget when money isn't actually moving. Temper the
+    # big-budget BOOST (the part of budget_factor above neutral) by payout velocity — a dead/
+    # creeping campaign forfeits most of its huge-pool bonus, so it can't float up on unspent
+    # budget × reach alone. Fail-open on fresh/unknown velocity (quality 1.0 -> boost untouched).
+    budget_vel_q = budget_velocity_quality(vel, days)
+    if budget_fac > 1.0:
+        budget_fac = round(1.0 + (budget_fac - 1.0) * budget_vel_q, 4)
+
     ppk = c.get("participants_per_1k_budget")
     comp_fac = competition_factor(ppk)
 
@@ -1070,6 +1112,12 @@ def composite_score(c):
     # usable-from-a-general-account / unknown -> 1.0 (fail-open).
     dp_fac = dedicated_page_factor(c.get("dedicated_page_factor"))
 
+    # person-name dedicated-account derank — the rules demand the account/username be dedicated to a
+    # SPECIFIC NAMED PERSON (a brand-new account per campaign). Resolved upstream from
+    # cfg.person_dedicated_penalty; a generic category dedication / ambiguous / absent -> 1.0 (fail-
+    # open). DISTINCT from dedicated_page_factor (a page used only for this campaign, person or not).
+    pdp_fac = person_dedicated_factor(c.get("person_dedicated_factor"))
+
     # payout-health derank — is the campaign ACTUALLY paying? A paying-dead trap (meaningful
     # submissions but ~$0 ever paid out) is heavy-deranked; a genuinely new campaign with $0
     # paid is left untouched (fail-open). Factor resolved upstream in enrich_active.
@@ -1088,7 +1136,7 @@ def composite_score(c):
         * ctype_fac * supply_fac * density_fac * access_fac * style_fac
         * drain_fac * growth_fac * sat_fac * recur_fac * reuse_fac * perf_fac
         * dc_fac * open_fac * lang_fac * live_fac * fpres_fac * payout_fac
-        * appr_fac * ss_fac * dp_fac, 6)
+        * appr_fac * ss_fac * dp_fac * pdp_fac, 6)
     if disqualified:
         composite = 0.0  # sinks to the bottom (still shown in the DISQUALIFIED section)
 
@@ -1135,6 +1183,8 @@ def composite_score(c):
         "velocity_basis": vel_basis,   # 'observed' (drain across runs) vs 'cumulative' (age-honest)
         "velocity_band": vel_band,
         "velocity_factor": vel_fac,
+        # FIX 2: fraction of the big-budget boost kept given how fast money is actually moving
+        "budget_velocity_quality": budget_vel_q,
         "days_active": days,
         "participants_per_1k_budget": ppk,
         "competition_factor": comp_fac,
@@ -1199,6 +1249,12 @@ def composite_score(c):
         "dedicated_page_required": bool(c.get("dedicated_page_required")),
         "dedicated_page_phrase": c.get("dedicated_page_phrase"),
         "dedicated_page_factor": dp_fac,
+        # person-name dedicated account required — derank when the account/username must be
+        # dedicated to a SPECIFIC named person (a fresh account per campaign). Fail-open otherwise.
+        "person_dedicated_required": bool(c.get("person_dedicated_required")),
+        "person_dedicated_target": c.get("person_dedicated_target"),
+        "person_dedicated_phrase": c.get("person_dedicated_phrase"),
+        "person_dedicated_factor": pdp_fac,
         # member-gated rules FLAG (not a derank) — the full rules live behind joining, so the
         # captured rules are only PARTIAL and shouldn't be fully trusted.
         "rules_incomplete": bool(c.get("rules_incomplete")),

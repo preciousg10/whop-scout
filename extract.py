@@ -429,6 +429,111 @@ def detect_dedicated_page(text):
     return " ".join(m.group(0).split())[:120]
 
 
+# --- PERSON-NAME dedicated account requirement (distinct from the category dedication above) ---
+# A worse trap than a generic dedicated page: the rules demand the posting ACCOUNT / channel /
+# USERNAME be dedicated to a SPECIFIC NAMED PERSON — "username must contain Yomi", "dedicated JZ
+# Garcia page", "account dedicated to clipping <Name>". That forces a brand-NEW dedicated account
+# PER campaign (high cost, doesn't scale), so scoring deranks it. It must be DISTINGUISHED from a
+# generic CATEGORY/theme dedication ("dedicated clipping account", "sports account", "faceless
+# page") — those are fine and must NOT derank. The distinguishing signal: the dedication target
+# is a PROPER NAME (Capitalized, matches the creator, and is not a category word), not a lowercase
+# theme word. Fail-loud: a pattern that matches but whose target can't be confidently classified
+# is returned as `uncertain` (no penalty, but surfaced/logged) rather than silently deranked.
+#
+# Category / theme words a dedication target may be — these are NOT person names, so a dedication
+# to one of them is a generic (allowed) dedication, never the person derank.
+_DEDICATION_GENERIC = {
+    "clipping", "clips", "clip", "clipper", "clippers", "content", "edit", "edits", "editing",
+    "compilation", "compilations", "highlight", "highlights", "fan", "fans", "fanpage",
+    "theme", "themed", "niche", "sports", "sport", "gaming", "game", "games", "gamer", "meme",
+    "memes", "funny", "viral", "faceless", "face", "streamer", "streamers", "streaming",
+    "stream", "streams", "podcast", "podcasts", "news", "music", "brand", "branded", "product",
+    "movie", "movies", "tv", "film", "films", "football", "soccer", "basketball", "nba", "nfl",
+    "ufc", "mma", "anime", "reaction", "reactions", "irl", "vlog", "vlogs", "the", "this",
+    "that", "your", "our", "new", "dedicated", "separate", "official", "campaign", "page",
+    "account", "channel", "profile", "only", "specific", "related", "topic", "niche", "our",
+    "single", "one",
+}
+# Structural nouns a captured target may trail into — trimmed off before classifying.
+_DEDICATION_STRUCTURAL = {"page", "account", "channel", "profile", "fanpage", "handle", "pages"}
+# A proper-name token: starts uppercase (covers "Yomi", "Denzel", and all-caps handles "JZ").
+_NAME_TOK = r"[A-Z][A-Za-z0-9'’.\-]*"
+_PERSON_DEDICATED_PATTERNS = (
+    # A: username / handle / channel name MUST contain / include / start-with <target>
+    (r"(?:user\s?name|handle|display\s+name|channel\s+name|page\s+name|account\s+name)\s+"
+     r"(?:must|has\s+to|have\s+to|should|needs?\s+to)\s+"
+     r"(?:contain|include|have|start\s+with|begin\s+with|feature|reference|mention|be)\s+"
+     r"(?:the\s+(?:name\s+|word\s+)?)?[\"'“”]?"
+     r"(" + _NAME_TOK + r"(?:\s+" + _NAME_TOK + r"){0,2})"),
+    # B: "dedicated <Name> page/account/channel/profile/fanpage"  ("dedicated JZ Garcia page")
+    (r"dedicated\s+(" + _NAME_TOK + r"(?:\s+" + _NAME_TOK + r"){0,2})\s+"
+     r"(?:page|account|channel|profile|fan\s?page)"),
+    # C: "page/account/... dedicated to (clipping/posting/...) <Name>"
+    (r"(?:page|account|channel|profile|fan\s?page)\s+(?:that\s+is\s+|must\s+be\s+)?"
+     r"dedicated\s+to\s+(?:clipping|posting|covering|uploading|only)?\s*"
+     r"(" + _NAME_TOK + r"(?:\s+" + _NAME_TOK + r"){0,2})"),
+)
+_PERSON_DEDICATED_RE = [re.compile(p, re.I) for p in _PERSON_DEDICATED_PATTERNS]
+
+
+def _classify_dedication_target(target, creator_name=None):
+    """(is_person, confidence, reason). is_person is True (a specific named person -> derank),
+    False (a generic category/theme -> do NOT derank), or None (matched but AMBIGUOUS -> fail-loud,
+    surfaced not silently deranked)."""
+    if not target:
+        return False, None, "empty target"
+    toks = [t for t in re.split(r"\s+", target.strip()) if t]
+    while toks and toks[-1].lower().strip(".,'’") in _DEDICATION_STRUCTURAL:
+        toks.pop()   # drop a trailing "page"/"account" the pattern swept in
+    if not toks:
+        return False, None, "only structural words (page/account)"
+    low = [t.lower().strip(".,'’") for t in toks]
+    if all(t in _DEDICATION_GENERIC for t in low):
+        return False, None, f"generic/category dedication ('{' '.join(low)}') — not a person"
+    if creator_name:
+        cn = {w.lower().strip(".,'’") for w in re.split(r"[\s@/]+", creator_name) if len(w) > 1}
+        if cn & {t for t in low if t not in _DEDICATION_GENERIC}:
+            return True, "high", f"target matches creator name '{creator_name}'"
+    proper = [t for t, l in zip(toks, low)
+              if re.match(r"[A-Z]", t) and l not in _DEDICATION_GENERIC]
+    if proper:
+        return True, "low", f"proper name '{' '.join(proper)}' (not a category word)"
+    return None, None, f"ambiguous target '{' '.join(toks)}'"
+
+
+def detect_person_dedicated(text, creator_name=None):
+    """Does the rules text require the posting ACCOUNT / channel / USERNAME be dedicated to a
+    SPECIFIC NAMED PERSON ("username must contain Yomi", "dedicated JZ Garcia page", "account
+    dedicated to clipping <Name>")? That forces a brand-new dedicated account PER campaign — a
+    real cost that doesn't scale — so scoring deranks it. DISTINCT from a generic CATEGORY/theme
+    dedication ("dedicated clipping account", "sports account", "faceless page"), which is fine
+    and never fires here.
+
+    High-precision + FAIL-LOUD: when a dedication/username pattern matches but the target can't be
+    confidently classified as a person vs a category, `uncertain=True` (NO penalty applied, but
+    surfaced so it can be logged/reviewed). A clear person match short-circuits and wins. Pass the
+    creator name (when known) to strengthen the match. Pure/testable. Returns a dict:
+        {required, phrase, target, is_person, confidence, uncertain, reason}."""
+    out = {"required": False, "phrase": None, "target": None, "is_person": False,
+           "confidence": None, "uncertain": False, "reason": "no person-dedication requirement"}
+    if not text:
+        return out
+    for rx in _PERSON_DEDICATED_RE:
+        for m in rx.finditer(text):
+            target = (m.group(1) or "").strip(" \t\"'“”.,")
+            is_person, conf, reason = _classify_dedication_target(target, creator_name)
+            phrase = " ".join(m.group(0).split())[:140]
+            if is_person is True:
+                out.update(required=True, phrase=phrase, target=target, is_person=True,
+                           confidence=conf, uncertain=False, reason=reason)
+                return out   # a clear person match wins outright
+            if is_person is None:
+                # matched but ambiguous — remember it (fail-loud), keep scanning for a clearer hit
+                out.update(phrase=phrase, target=target, is_person=False,
+                           uncertain=True, reason=reason)
+    return out
+
+
 # --- member-gated / incomplete rules -------------------------------------------
 # Some campaigns keep the REAL rules behind joining ("CHECK FULL GUIDELINES ON SIDEBAR AFTER YOU
 # JOIN", "full rules after joining", "reglas completas después de unirte"), so Scout only ever

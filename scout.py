@@ -230,6 +230,16 @@ class Config:
     dedicated_page_enabled: bool = True
     dedicated_page_penalty: float = 0.4      # composite × this when a dedicated page is required
 
+    # PERSON-NAME dedicated account derank — WORSE than a generic dedicated page: the rules demand
+    # the account/channel/username be dedicated to a SPECIFIC NAMED PERSON ("username must contain
+    # Yomi", "dedicated JZ Garcia page", "account dedicated to clipping <Name>"), forcing a brand-
+    # new dedicated account PER campaign (high cost, doesn't scale). DERANKED (composite ×
+    # person_dedicated_penalty), NOT excluded. A generic CATEGORY/theme dedication ("dedicated
+    # clipping account", "sports page", "faceless page") is fine and never fires. Fail-loud: an
+    # ambiguous target is flagged uncertain (no penalty) and logged. extract.detect_person_dedicated.
+    person_dedicated_enabled: bool = True
+    person_dedicated_penalty: float = 0.35   # composite × this when dedicated to a named person
+
     # HIGH VIEW-MINIMUM-FOR-PAYOUT trap — a hard per-clip VIEW count required before ANY payout
     # ("must hit 10K views for a payout", "$4 mínimo (10.000 visualizaciones)"). DISTINCT from the
     # min-payout-DOLLAR gate; it feeds scoring.min_view_threshold_factor, which scales the penalty
@@ -836,6 +846,12 @@ _ANALYSIS_DEFAULTS = {
     # cost) + MEMBER-GATED rules FLAG (the full rules live behind joining, so captured rules are
     # partial). Both English + Spanish; the dedicated-page factor composite_score multiplies in.
     "dedicated_page_required": False, "dedicated_page_phrase": None, "dedicated_page_factor": 1.0,
+    # PERSON-NAME dedicated account derank (account/username must be dedicated to a SPECIFIC named
+    # person — a brand-new account per campaign). Distinct from the category dedication above;
+    # person_dedicated is the full detection dict, the flat flags feed the report + composite factor.
+    "person_dedicated": None, "person_dedicated_required": False,
+    "person_dedicated_phrase": None, "person_dedicated_target": None,
+    "person_dedicated_factor": 1.0,
     "rules_incomplete": False, "rules_incomplete_phrase": None,
     # Prohibited/vice category exclusion (gambling/betting/casino/alcohol/vape/…). Like
     # rules_unreadable, excluded_prohibited=True REMOVES the campaign from the ranked output
@@ -937,12 +953,17 @@ def _make_snapshot(rec, ts):
     }
 
 
-def enrich_active(rec, cfg, prev_rec=None, now=None):
+def enrich_active(rec, cfg, prev_rec=None, now=None, record_snapshot=True):
     """Derive every analysis dimension for one active record: minimum-payout viability,
     source scaffold, max payout, competition, category, hard disqualifiers, campaign
     age + payout velocity, and the cross-run snapshot/trend. Idempotent; reads only
     already-scraped fields (the follower + clipper lookups happen in later passes).
-    `prev_rec` is the same campaign from the previous run (for trends + first_seen)."""
+    `prev_rec` is the same campaign from the previous run (for trends + first_seen).
+
+    `record_snapshot=False` (the offline --rescore path) recomputes every derived signal from
+    stored text but does NOT append a new per-run snapshot / trend — a rescore is not a new data
+    point, so the accumulated `snapshot_history` (and the drain/growth projections built on it)
+    must be left exactly as captured. All other derivations stay idempotent and safe to re-run."""
     now = now or datetime.now(timezone.utc)
     rules = rec.get("rules_text")
     pay = rec.get("pay_per_1k")
@@ -977,6 +998,30 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     rec["dedicated_page_required"] = bool(dp_phrase)
     rec["dedicated_page_phrase"] = dp_phrase
     rec["dedicated_page_factor"] = cfg.dedicated_page_penalty if dp_phrase else 1.0
+
+    # PERSON-NAME dedicated account — the rules demand the account/channel/username be dedicated to
+    # a SPECIFIC NAMED PERSON ("username must contain Yomi", "dedicated JZ Garcia page"), forcing a
+    # brand-new dedicated account PER campaign. DERANKED (× cfg.person_dedicated_penalty), NOT
+    # excluded. A generic CATEGORY dedication ("dedicated clipping account", "sports page") is fine
+    # and never fires. Fail-loud: an ambiguous target is flagged uncertain (no penalty) + logged.
+    if getattr(cfg, "person_dedicated_enabled", True):
+        creator_name = rec.get("creator") or (rec.get("source") or {}).get("name")
+        pd = extract.detect_person_dedicated(rules_bundle, creator_name)
+    else:
+        pd = {"required": False, "phrase": None, "target": None, "is_person": False,
+              "confidence": None, "uncertain": False, "reason": "disabled"}
+    rec["person_dedicated"] = pd
+    rec["person_dedicated_required"] = bool(pd.get("required"))
+    rec["person_dedicated_phrase"] = pd.get("phrase")
+    rec["person_dedicated_target"] = pd.get("target")
+    rec["person_dedicated_factor"] = (cfg.person_dedicated_penalty
+                                      if pd.get("required") else 1.0)
+    if pd.get("required"):
+        print(f"  [person-dedicated] {rec.get('name')!r}: {pd.get('reason')} "
+              f"→ deranked ×{cfg.person_dedicated_penalty} (phrase: {pd.get('phrase')!r})")
+    elif pd.get("uncertain"):
+        print(f"  [person-dedicated?] {rec.get('name')!r}: UNCERTAIN — {pd.get('reason')} "
+              f"(phrase: {pd.get('phrase')!r}) — NOT deranked, review")
 
     # MEMBER-GATED / incomplete rules — the full guidelines live behind joining ("check full
     # guidelines on the sidebar after you join"), so the captured rules are only PARTIAL. This is
@@ -1031,7 +1076,12 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
     # stopword heuristic (NO Groq/network); fails OPEN — short/ambiguous text is assumed
     # English so we never wrongly derank. The resolved factor is stored so composite_score
     # just multiplies it (English/unknown -> 1.0, leaving English composites EXACTLY unchanged).
-    lang = language.detect_language(language.language_text(rec))
+    # FIX 1: detect PER-FIELD (title / creator / description / each rules body), not over one
+    # combined blob. A short non-English title or description is diluted below the stopword
+    # thresholds when concatenated with long English rules (the Yomi Denzel trap — a French
+    # description under English rules ranked #1), so a clearly non-English title/description now
+    # fires the derank even when the rules doc is English. Fail-open is unchanged.
+    lang = language.detect_language_fields(language.language_segments(rec))
     rec["language"] = lang
     # Top-level, clipper-readable flags so the CLIPPER's pick step can HARD-SKIP a non-English
     # campaign BEFORE it wastes a download+transcribe (the NIVEL 0 case: 4.45h downloaded + a
@@ -1123,14 +1173,17 @@ def enrich_active(rec, cfg, prev_rec=None, now=None):
 
     # cross-run snapshot + accumulating history (built on, not replacing, prior runs) +
     # trend. The history is what the budget-drain / participant-growth projections use.
-    carried_hist = list((prev_rec or {}).get("snapshot_history") or [])
-    prev_snap = (prev_rec or {}).get("snapshot")
-    if prev_snap:
-        carried_hist.append(prev_snap)
-    cap = getattr(cfg, "max_snapshot_history", 20)
-    rec["snapshot_history"] = carried_hist[-cap:]
-    rec["snapshot"] = _make_snapshot(rec, now.isoformat())
-    rec["trends"] = scoring.compute_trends(rec["snapshot"], prev_snap)
+    # Skipped on an offline --rescore (record_snapshot=False): a rescore adds no new data point,
+    # so the stored snapshot/history/trends are preserved untouched.
+    if record_snapshot:
+        carried_hist = list((prev_rec or {}).get("snapshot_history") or [])
+        prev_snap = (prev_rec or {}).get("snapshot")
+        if prev_snap:
+            carried_hist.append(prev_snap)
+        cap = getattr(cfg, "max_snapshot_history", 20)
+        rec["snapshot_history"] = carried_hist[-cap:]
+        rec["snapshot"] = _make_snapshot(rec, now.isoformat())
+        rec["trends"] = scoring.compute_trends(rec["snapshot"], prev_snap)
 
     # source scaffold (preserve counts already retrieved on a prior run)
     existing = rec.get("source")
@@ -2392,6 +2445,86 @@ def run_test_capture(session, pacer, cfg, n):
 
 
 # --- main ----------------------------------------------------------------------
+def rescore_offline(cfg):
+    """Re-run ranking/scoring over the EXISTING campaigns.json WITHOUT opening a browser.
+
+    The language / velocity / person-dedication fixes (and every other `enrich_active`
+    derivation) read only ALREADY-STORED text, so they can be recomputed offline in seconds
+    instead of a full ~12h re-scrape. This:
+      • reloads campaigns.json,
+      • re-runs `enrich_active` on each scraped/refreshed record (record_snapshot=False, so the
+        accumulated run history is preserved) — recomputing language (now PER-FIELD), payout
+        velocity, person-dedication, dedicated-page, payout-health, footage-presence,
+        disqualifiers, min-view gate, etc. from stored text,
+      • PRESERVES network-derived signals already captured (Groq category, proven clippability,
+        creator reach, footage intake / liveness) — those are NEVER re-fetched here,
+      • re-runs the strategic signals + `composite_score` + category ranking,
+      • rewrites campaigns.json / campaigns_summary.md and prints the terminal report.
+
+    It NEVER re-scrapes. Card-only stubs (never opened) keep their UNKNOWN signals — only a real
+    scrape can fill those — so they're reported as-is with a note. The 20h guard / state.json is
+    left untouched (a rescore is not a run)."""
+    path = Path(cfg.campaigns_path)
+    if not path.exists():
+        print(f"No {cfg.campaigns_path} to rescore — run a normal scrape first.")
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"Could not read {cfg.campaigns_path}: {e}")
+        return
+    all_records = data.get("campaigns", [])
+    if not all_records:
+        print(f"{cfg.campaigns_path} has no campaigns to rescore.")
+        return
+
+    active = [r for r in all_records if r.get("status") in ("scraped", "refreshed")]
+    for rec in active:
+        # Preserve the network-derived categorization (Groq/cache): enrich_active would otherwise
+        # overwrite rec["category"] with the cheap keyword baseline. A rescore does NOT
+        # recategorize (that needs Groq via --recategorize on a normal run).
+        had_category = rec.get("category") is not None
+        saved_cat = (rec.get("category"), rec.get("categories"),
+                     rec.get("category_source"), rec.get("category_confidence"))
+        enrich_active(rec, cfg, prev_rec=None, record_snapshot=False)
+        if had_category:
+            (rec["category"], rec["categories"],
+             rec["category_source"], rec["category_confidence"]) = saved_cat
+        rec["pre_score"] = pre_score(rec)
+
+    # Strategic signals over the FULL list (recurring-creator counts span all history), then
+    # recompute composites — mirrors assemble's scoring loop; statuses/exclusions are unchanged.
+    strategic_mod.compute_strategic_signals(all_records)
+    rescored = 0
+    for rec in all_records:
+        if rec.get("status") in ("scraped", "refreshed"):
+            comp, breakdown = composite_score(rec)
+            rec["composite_score"] = comp
+            rec["composite_breakdown"] = breakdown
+            rescored += 1
+        else:
+            rec.setdefault("pre_score", 0)
+            rec.setdefault("composite_score", 0)
+            rec.setdefault("composite_breakdown", None)
+
+    category_ranking = scoring.rank_categories(all_records, cfg.category_agg)
+    category_summary = data.get("category_summary")
+    report.write_json(cfg.campaigns_path, all_records, category_ranking=category_ranking,
+                      category_summary=category_summary)
+    report.write_summary_md(cfg.summary_path, all_records, category_ranking=category_ranking,
+                            category_summary=category_summary)
+    print(f"\nRESCORE (offline, no browser): recomputed {rescored} campaign(s) from stored text.")
+    never_scraped = sum(1 for r in all_records if not _has_cached_detail(r)
+                        and r.get("status") != "completed")
+    if never_scraped:
+        print(f"  Note: {never_scraped} known campaign(s) were never fully scraped (card-only "
+              f"stubs) — their signals stay UNKNOWN; a normal scrape is needed to capture them.")
+    report.terminal_report(
+        all_records, db_total=len(all_records), new_count=0, failures=0,
+        category_ranking=category_ranking, category_summary=category_summary,
+    )
+
+
 def main():
     cfg = CONFIG
     parser = argparse.ArgumentParser(description="Scout — personal Whop Content Rewards scraper.")
@@ -2400,6 +2533,11 @@ def main():
     parser.add_argument("--recategorize", action="store_true",
                         help="clear the category cache and re-run the Groq categorizer on every "
                              "campaign (default reuses cached categories for unchanged content)")
+    parser.add_argument("--rescore", "--rerank", action="store_true", dest="rescore",
+                        help="OFFLINE: recompute ranking/scoring (language, velocity, person-"
+                             "dedication, composites, category ranking) over the EXISTING "
+                             "campaigns.json WITHOUT opening the browser — no re-scrape. Rewrites "
+                             "campaigns.json + campaigns_summary.md. Use after a scoring change.")
     parser.add_argument("--probe", action="store_true", help="confirm selectors: screenshot + dump DOM")
     parser.add_argument("--test-capture", nargs="?", type=int, const=5, default=None, metavar="N",
                         help="THROWAWAY diagnostic: scrape only the first N campaigns (default 5) "
@@ -2422,6 +2560,12 @@ def main():
             done = update_completed(cfg.completed_path, args.unmark_done, remove=True)
             print(f"Removed {len(args.unmark_done)} campaign(s) from DONE.")
         print(f"DONE list now has {len(done)} campaign(s) -> {cfg.completed_path}")
+        return
+
+    # Offline rescore/rerank — recompute scoring over the stored campaigns.json with NO browser
+    # and NO re-scrape (the language/velocity/person-dedication fixes read only stored text).
+    if args.rescore:
+        rescore_offline(cfg)
         return
 
     state = State(cfg.state_path)

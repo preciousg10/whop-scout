@@ -157,11 +157,68 @@ def language_text(campaign):
     creator handle/description (all already scraped — no new work). Reading every rules body (not
     just rules_text + modal_requirements_text) is FIX 4: a Spanish campaign whose rules landed in
     modal_rules_text or a fetched doc is still detected instead of slipping through as English."""
+    return " ".join(t for _, t in language_segments(campaign) if t)
+
+
+def language_segments(campaign):
+    """Labeled text segments for PER-FIELD language detection (FIX 1). Returns
+    [(label, text), ...] over every captured text field — title/name, creator name/handle,
+    audience/description, and each rules body. Splitting into segments (instead of one blob) is
+    what catches a non-English TITLE or DESCRIPTION when the rules doc happens to be English:
+    the Yomi Denzel trap was a short French description ("gagne 1$ pour chaque 1000 vues")
+    drowned out to invisibility in a combined blob of long English rules. All fields are already
+    scraped — no new work."""
     src = campaign.get("source") or {}
     handles = " ".join(h.get("handle") or h.get("url") or ""
                        for h in (src.get("handles") or []) if isinstance(h, dict))
-    return " ".join(str(x) for x in (
-        campaign.get("name"), campaign.get("rules_text"),
-        campaign.get("modal_requirements_text"), campaign.get("modal_rules_text"),
-        campaign.get("notion_rules_text"), campaign.get("rules_doc_text"),
-        src.get("name"), src.get("description"), handles) if x)
+    modal = " ".join(str(x) for x in (campaign.get("modal_requirements_text"),
+                                      campaign.get("modal_rules_text")) if x)
+    docs = " ".join(str(x) for x in (campaign.get("notion_rules_text"),
+                                     campaign.get("rules_doc_text")) if x)
+    return [
+        ("title", str(campaign.get("name") or "")),
+        ("creator", " ".join(x for x in (str(src.get("name") or ""), handles) if x.strip())),
+        ("description", str(src.get("description") or "")),
+        ("rules", str(campaign.get("rules_text") or "")),
+        ("modal", modal),
+        ("doc", docs),
+    ]
+
+
+def detect_language_fields(segments):
+    """Detect language across labeled segments (FIX 1), firing `nonenglish` when the COMBINED
+    text OR ANY substantive individual segment reads clearly non-English. A short non-English
+    title/description is diluted below the stopword thresholds in a combined blob of long English
+    rules, so per-segment detection is what surfaces it — if the DESCRIPTION or TITLE is clearly
+    non-English we derank even when the rules doc is English.
+
+    Fail-open is preserved exactly: `detect_language` already returns nonenglish=False for short/
+    ambiguous text, so a per-segment verdict only fires on a genuinely clear signal. Returns the
+    same dict shape as `detect_language`, plus `trigger` = which segment (or 'combined') fired.
+    Never raises."""
+    seg_list = [(lbl, t) for lbl, t in (segments or []) if t and t.strip()]
+    combined = detect_language(*[t for _, t in seg_list])
+    if combined.get("nonenglish"):
+        combined["trigger"] = "combined"
+        combined["basis"] = "combined text — " + combined.get("basis", "")
+        return combined
+    # Per-field: any substantive segment that clearly reads non-English fires the derank even
+    # though the combined blob (dominated by English rules) did not.
+    hits = []
+    for lbl, t in seg_list:
+        r = detect_language(t)
+        if r.get("nonenglish"):
+            r["trigger"] = lbl
+            hits.append((lbl, r))
+    if hits:
+        # Prefer the strongest signal: high-confidence first, then the largest non-English
+        # stopword fraction for its detected language.
+        def strength(item):
+            r = item[1]
+            return (r.get("confidence") == "high",
+                    (r.get("scores") or {}).get(r.get("language"), 0.0))
+        lbl, r = max(hits, key=strength)
+        r["basis"] = f"{lbl} field — " + r.get("basis", "")
+        return r
+    combined["trigger"] = None
+    return combined

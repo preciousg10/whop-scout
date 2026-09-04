@@ -186,6 +186,26 @@ def _fmt_payout(c):
     return f"{head} → {status} ({ph.get('reason')})"
 
 
+def _fmt_velocity(c):
+    """Payout-velocity line (FIX 2): how fast the budget is ACTUALLY moving + the derank. Shows
+    why a big-budget-but-dead campaign sinks — 'UNKNOWN' fresh campaigns are never penalized."""
+    b = c.get("composite_breakdown") or {}
+    vel = b.get("payout_velocity")
+    band = b.get("velocity_band")
+    if vel is None or band == "fresh":
+        return "fresh/UNKNOWN (too new or budget/age unknown — no penalty)"
+    fac = b.get("velocity_factor")
+    basis = b.get("velocity_basis") or "cumulative"
+    txt = f"{vel:.4f} budget-frac/day ({band or 'unknown'}, {basis})"
+    bits = []
+    if fac is not None and fac < 1.0:
+        bits.append(f"velocity x{fac}")
+    bvq = b.get("budget_velocity_quality")
+    if bvq is not None and bvq < 1.0:
+        bits.append(f"big-budget boost tempered to {bvq:.0%}")
+    return txt + (f" → {', '.join(bits)}" if bits else "")
+
+
 def _fmt_approval(c):
     """Approval-rate line — ALWAYS shown. The % of submissions a campaign approves/pays:
     'approval: 88%' / 'approval: 22% → LOW x0.2' / 'approval: UNKNOWN'."""
@@ -256,6 +276,21 @@ def _warning_flags(c):
         ph = c.get("dedicated_page_phrase")
         ph_txt = f": \"{ph}\"" if ph else ""
         flags.append(f"DEDICATED-PAGE required{fac_txt}{ph_txt}")
+    if c.get("person_dedicated_required"):
+        fac = b.get("person_dedicated_factor")
+        fac_txt = f" (composite x{fac})" if fac is not None else ""
+        tgt = c.get("person_dedicated_target")
+        tgt_txt = f" [person: {tgt}]" if tgt else ""
+        ph = c.get("person_dedicated_phrase")
+        ph_txt = f": \"{ph}\"" if ph else ""
+        flags.append(f"PERSON-DEDICATED account required{tgt_txt}{fac_txt}{ph_txt}")
+    else:
+        pd = c.get("person_dedicated") or {}
+        if pd.get("uncertain"):
+            ph = pd.get("phrase")
+            ph_txt = f": \"{ph}\"" if ph else ""
+            flags.append(f"PERSON-DEDICATED? uncertain — {pd.get('reason')}{ph_txt} "
+                         f"(NOT deranked — review)")
     if c.get("rules_incomplete"):
         ph = c.get("rules_incomplete_phrase")
         ph_txt = f": \"{ph}\"" if ph else ""
@@ -286,6 +321,7 @@ def _campaign_block(c, rank):
     lines.append(f"Footage: {_fmt_footage_presence(c)}")
     lines.append(f"Footage liveness: {_fmt_liveness(c)}")
     lines.append(f"Payout: {_fmt_payout(c)}")
+    lines.append(f"Velocity: {_fmt_velocity(c)}")
     lines.append(f"Approval: {_fmt_approval(c)}")
     lines.append(f"Data confidence: {_core_known(c)}/5 core signals known")
     lines.append(f"Language: {_fmt_language(c)}")
@@ -627,6 +663,10 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
                        if ((c.get("composite_breakdown") or {}).get("approval_rate_factor")
                            or 1.0) < 1.0)
     self_sourced = sum(1 for c in active if c.get("self_sourced"))
+    person_dedicated = sum(1 for c in active if c.get("person_dedicated_required"))
+    slow_velocity = sum(1 for c in active
+                        if ((c.get("composite_breakdown") or {}).get("velocity_factor")
+                            or 1.0) < 1.0)
     capture_suspect = sum(1 for c in active if c.get("capture_suspect"))
     clip_unk = sum(1 for c in active
                    if (c.get("repeatable_clippability") or {}).get("score") is None)
@@ -650,6 +690,8 @@ def terminal_report(campaigns, *, db_total, new_count, failures, category_rankin
     print(f"  DEAD-PAYOUT (active but ~$0 paid)    : {dead_payout}")
     print(f"  LOW-APPROVAL (< floor, deranked)     : {low_approval}")
     print(f"  SELF-SOURCED footage (deranked)      : {self_sourced}")
+    print(f"  PERSON-DEDICATED account (deranked)  : {person_dedicated}")
+    print(f"  Slow/dead payout velocity (deranked) : {slow_velocity}")
     print(f"  Capture-suspect (doc maybe missed)   : {capture_suspect}")
     print(f"  Clippability UNKNOWN                 : {clip_unk}")
     print(f"  Failures (see errors.log)            : {failures}")

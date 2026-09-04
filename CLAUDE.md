@@ -28,6 +28,12 @@ python scout.py
 python scout.py --force     # ignore the 20h once-daily guard
 python scout.py --refresh   # full re-scrape of every campaign (default is delta)
 python scout.py --recategorize  # clear the category cache + re-run the Groq categorizer
+python scout.py --rescore   # OFFLINE re-rank/re-score over the EXISTING campaigns.json — NO
+                            #   browser, NO re-scrape (alias --rerank). Recomputes every
+                            #   enrich_active signal (language, velocity, person-dedication,
+                            #   composites, category ranking) from already-stored text and
+                            #   rewrites campaigns.json + campaigns_summary.md. Use after a
+                            #   SCORING change instead of a full ~12h re-scrape.
 
 # DONE list — mark campaign(s) the CLIPPER has exhausted (excluded from scraping AND
 # ranking; "already scraped" is NOT done). Pure file edit, no browser; writes
@@ -52,12 +58,14 @@ There is no test framework wired up. The DOM-agnostic parsers in `extract.py`
 `parse_min_view_threshold`, `references_resource_doc`, `extract_handles`, `parse_max_payout`,
 `participants_per_1k_budget`, `payout_velocity`, `parse_activity_count`,
 `detect_disqualifiers`, `classify_openness`, `classify_category`, `classify_categories`,
+`detect_dedicated_page`, `detect_person_dedicated`,
 `modal_rules_section`, `has_substantive_rules`, `full_modal_rules`) are pure functions with no
 Playwright dependency — test them by importing `extract` directly, no browser needed. `scoring.py`
 (`pre_score`, `clippability`, `composite_score`, `pay_rate_factor`, `reach_factor`,
 `expected_earnings`, `earnings_factor`, `core_signals_known`, `data_confidence_factor`,
 `openness_factor`, `repeatable_factor`, `max_payout_factor`, `min_view_threshold_factor`,
-`payout_health`/`payout_health_factor`, `velocity_factor`/`_band`,
+`payout_health`/`payout_health_factor`, `velocity_factor`/`_band`, `budget_velocity_quality`,
+`person_dedicated_factor`,
 `competition_factor`, `compute_trends`, `content_type_factor`, `footage_supply_factor`,
 `action_density_factor`, `footage_access_factor`, `footage_presence_factor`, `style_fit`, `rank_categories`,
 `project_budget_drain`,
@@ -67,7 +75,8 @@ signal/hash/prompt/parse/validate layer (`campaign_signals`, `content_hash`, `bu
 `parse_batch_response`, `validate_result`, `keyword_result`) is testable with no Groq/network.
 `strategic.py`
 (`_norm_creator`, `compute_strategic_signals`) is testable with plain dicts. `language.py`
-(`detect_language`, `language_text`) is a pure offline detector — no network/Groq. `liveness.py`'s
+(`detect_language`, `detect_language_fields`, `language_segments`, `language_text`) is a pure
+offline detector — no network/Groq. `liveness.py`'s
 decision layer (`campaign_liveness`, `classify_link_verdict`, `_normalize_channel_videos_url`)
 is pure/testable with no network — feed it plain verdict dicts. So is `intake.py`'s analysis layer (`classify_source`, `content_type_from_brief`,
 `classify_content_type`, `analyze_transcript_density`, `aggregate_access`,
@@ -225,7 +234,11 @@ fat-tailed clip distribution — two viral clips out of 2,000 read "healthy" whi
 else earned nothing — so it can't distinguish "clips reliably land" from "two got lucky";
 the stats chart is no longer scraped at all). Supporting: `max_payout_factor` (a low per-video cap penalizes the viral
 upside; uncapped is best), `velocity_factor` (paid/total/day — an OLD campaign creeping
-along is a strong negative; a FRESH one is neutral, never penalized), `competition_factor`
+along is a strong negative; a FRESH one is neutral, never penalized — weighted HARD, floor
+~0.12, so a near-dead campaign sinks well below a proven steady payer; the big-budget BOOST is
+ALSO tempered by velocity via `budget_velocity_quality` so a huge UNSPENT pool that isn't moving
+can't float up on budget × reach alone — both fail open on fresh/UNKNOWN velocity),
+`competition_factor`
 (participants per $1k budget), and the four **footage-substance** factors from `intake.py`:
 `content_type_factor` (non-standard = heavy penalty), `footage_supply_factor` (recurring >
 one-time), `action_density_factor` (logistics-heavy = heavy penalty), `footage_access_factor`
@@ -328,6 +341,21 @@ surfaces as a `CAPTURE-SUSPECT` report warning instead of passing as "no docs" �
 ONLY, it never touches capture logic. It reads only already-scraped fields, so it's pure/cheap
 and idempotent.
 
+**Offline re-scoring (`--rescore`/`--rerank` → `rescore_offline`).** Because `enrich_active` and
+`composite_score` read ONLY already-stored text, a SCORING change (e.g. the language / velocity /
+person-dedication fixes) can be re-applied to the whole board WITHOUT a browser or a re-scrape.
+`rescore_offline` reloads `campaigns.json`, re-runs `enrich_active(record_snapshot=False)` on each
+scraped/refreshed record (recomputing language, velocity, person-dedication, dedicated-page,
+payout-health, footage-presence, disqualifiers, the min-view gate, and the category KEYWORD
+baseline), re-runs `strategic.compute_strategic_signals` + `composite_score` + `rank_categories`,
+and rewrites `campaigns.json` + `campaigns_summary.md`. It **never re-scrapes** and **preserves the
+network-derived signals already captured** — Groq category (restored over the keyword baseline),
+proven clippability, creator reach, footage intake/liveness — plus the accumulated
+`snapshot_history` (the `record_snapshot=False` flag skips appending a new per-run data point, so
+run history and the drain/growth projections are untouched). It leaves `state.json` / the 20h guard
+alone (a rescore is not a run). Only a genuine card-only stub (never opened → no `scraped_at`) still
+needs a real scrape to fill its UNKNOWN signals; the run notes how many remain.
+
 **Non-English derank (`language.py` + `cfg.nonenglish_penalty`, default 0.15).** Scout is an
 ENGLISH-ONLY operation, so a campaign whose cheap text (name + rules + modal + creator
 handle/description) reads as CLEARLY non-English (Spanish/Portuguese/French via a stopword-ratio
@@ -335,10 +363,32 @@ heuristic, or a non-Latin script) has its composite multiplied by `cfg.nonenglis
 heavy DERANK (~85% off), NOT a hard exclude (it sinks but stays on the board). Detection is
 OFFLINE and Groq-free (`language.detect_language`, a pure function) and FAILS OPEN: short or
 ambiguous text returns `nonenglish=False` (factor 1.0), so English composites are left EXACTLY
-unchanged. `enrich_active` stores `rec["language"]` (detected language + `nonenglish` +
+unchanged. Detection runs PER FIELD, not over one combined blob (`language.detect_language_fields`
+over `language.language_segments` — title / creator / description / each rules body): a short
+non-English TITLE or DESCRIPTION is diluted below the stopword thresholds when concatenated with
+long English rules (the Yomi Denzel trap — a French description under English rules ranked #1), so
+a clearly non-English title/description now fires the derank even when the rules doc is English.
+`enrich_active` stores `rec["language"]` (detected language + `nonenglish` +
 confidence + basis) and the resolved `rec["language_penalty_factor"]`; `composite_score`
 multiplies that factor in and records it in the breakdown. Surfaced per campaign in
 `campaigns_summary.md` (a "Language:" line + a `NON-ENGLISH` flag) and counted in the report.
+
+**Person-name dedicated-account derank (`extract.detect_person_dedicated` + `cfg.person_dedicated_penalty`,
+default 0.35).** WORSE than the generic dedicated-page derank: a campaign whose rules demand the
+posting ACCOUNT / channel / USERNAME be dedicated to a SPECIFIC NAMED PERSON — "username must
+contain Yomi", "dedicated JZ Garcia page", "account dedicated to clipping <Name>" — forces a
+brand-new dedicated account PER campaign (high cost, doesn't scale), so its composite is
+multiplied by `cfg.person_dedicated_penalty` (DERANK, NOT exclude). It is DISTINGUISHED from a
+generic CATEGORY/theme dedication ("dedicated clipping account", "sports account", "faceless
+page"), which is fine and NEVER fires: the target is classified as a person only when it matches
+the creator name or is a Capitalized proper name that is not a category word (lowercase theme
+words never trip it). FAIL-LOUD: a pattern that matches but whose target can't be confidently
+classified is flagged `uncertain` (NO penalty applied) and LOGGED to the console + a
+`PERSON-DEDICATED? uncertain` report flag for review — never silently deranked. `enrich_active`
+stores `rec["person_dedicated"]` (the full detection dict) + the flat flags + the resolved
+`rec["person_dedicated_factor"]`, which `composite_score` multiplies via
+`scoring.person_dedicated_factor`. Surfaced per campaign as a `PERSON-DEDICATED account required`
+flag (with the target + triggering phrase) and counted in the terminal report.
 
 **Footage LINK-LIVENESS derank (`liveness.py` + `cfg.liveness_dead_penalty`, default 0.15).**
 Distinct from intake's *accessibility* ("did the URL respond?"): liveness asks "does the link
