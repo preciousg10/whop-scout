@@ -16,7 +16,7 @@ import random
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -208,6 +208,19 @@ class Config:
     # hard-excluded (a missed link shouldn't permanently kill it). FAILS OPEN: if the detail
     # section was never loaded (unscraped stub), footage presence is undeterminable -> no penalty.
     no_footage_penalty: float = 0.15
+
+    # DOC-SOURCED footage recovery — BEFORE applying the no-footage derank, mine the campaign's
+    # already-fetched brief text (modal/rules + the Google-Doc rules text + Notion page) for a
+    # PUBLIC footage URL (Drive folder/file, YouTube, Kick, Twitch, direct file). Whop very often
+    # puts the real footage link INSIDE the linked brief rather than as an anchor on the modal, so
+    # without this those campaigns are wrongly hit by the no-footage derank AND skipped by
+    # intake/liveness (which then can't verify footage that actually exists). Any link found is
+    # added to source_links (provenance kept in doc_sourced_footage) and footage_presence is
+    # re-resolved, so intake/liveness then probe the REAL link (a private/dead one is still caught).
+    # When doc_footage_fetch, the gdoc/Notion page is fetched on demand (URL-preserving) for
+    # footage-less campaigns whose stored text has no link yet; cached via doc_footage_checked.
+    doc_footage_enabled: bool = True
+    doc_footage_fetch: bool = True           # fetch gdoc/Notion page to mine footage links
 
     # APPROVAL-RATE derank — every Whop campaign header shows an approval rate (the % of
     # submissions that get approved/paid). A KNOWN rate BELOW approval_rate_floor is deranked, and
@@ -842,6 +855,11 @@ _ANALYSIS_DEFAULTS = {
     # (True/False/None) + the matched phrase + the resolved factor composite_score multiplies in.
     "rules_doc_text": None, "self_sourced": None, "self_sourced_phrase": None,
     "self_sourced_factor": 1.0,
+    # DOC-SOURCED footage recovery — footage URLs mined out of the brief text (modal/rules/gdoc/
+    # Notion) and added to source_links so a campaign whose footage link lives in the doc isn't
+    # wrongly hit by the no-footage derank. doc_sourced_footage lists the recovered URLs (provenance);
+    # doc_footage_checked caches that the on-demand doc/Notion fetch was already tried (avoid refetch).
+    "doc_sourced_footage": [], "doc_footage_checked": False,
     # DEDICATED-PAGE required derank (page/account usable ONLY for this campaign — an account-slot
     # cost) + MEMBER-GATED rules FLAG (the full rules live behind joining, so captured rules are
     # partial). Both English + Spanish; the dedicated-page factor composite_score multiplies in.
@@ -1806,6 +1824,121 @@ def enrich_self_sourced_docs(records, cfg):
     return fetched, flagged
 
 
+# A footage URL pasted into a brief is often wrapped in a Google redirect
+# (docs/Notion export links as https://www.google.com/url?q=<real>&sa=...). Unwrap those.
+_URL_RE = re.compile(r"https?://[^\s\"'<>)\]}]+", re.I)
+
+
+def _clean_footage_url(url):
+    """Unwrap a Google redirect wrapper and strip trailing punctuation from a scraped URL."""
+    import urllib.parse
+    u = url.strip().rstrip(".,;)]}>\"'")
+    m = re.match(r"https?://(?:www\.)?google\.com/url\?", u, re.I)
+    if m:
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(u).query).get("q")
+        if q:
+            u = urllib.parse.unquote(q[0]).rstrip(".,;)]}>\"'")
+    return u
+
+
+def _footage_urls_from_text(text):
+    """Pull PUBLIC footage URLs (Drive folder/file, YouTube, Kick, Twitch, direct file) out of a
+    blob of brief text. Doc/other links are dropped (only intake.FOOTAGE_KINDS kept). Deduped,
+    order-preserving. Pure — no network."""
+    out = []
+    seen = set()
+    for raw in _URL_RE.findall(text or ""):
+        u = _clean_footage_url(raw)
+        if u in seen:
+            continue
+        if intake_mod.classify_source(u) in intake_mod.FOOTAGE_KINDS:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def _fetch_raw_for_footage(url, timeout=20):
+    """Best-effort fetch of a public gdoc/Notion page as RAW text with URLs INTACT (unlike the
+    rules-text fetchers, which strip hrefs). Google Docs use the HTML export (captures both pasted
+    text URLs and hyperlink hrefs); everything else fetches the page HTML. Returns raw string or
+    '' — never raises."""
+    import urllib.request
+    target = url
+    m = re.search(r"docs\.google\.com/document/d/([A-Za-z0-9_-]+)", url or "")
+    if m:
+        target = f"https://docs.google.com/document/d/{m.group(1)}/export?format=html"
+    try:
+        req = urllib.request.Request(target, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _doc_footage_text(rec):
+    """All already-captured brief text for a record, for footage-URL mining."""
+    return " ".join(t for t in (rec.get("rules_text"), rec.get("modal_requirements_text"),
+                                rec.get("modal_rules_text"), rec.get("rules_doc_text"),
+                                rec.get("notion_rules_text")) if t)
+
+
+def enrich_doc_footage(records, cfg):
+    """Recover footage links that live INSIDE a campaign's brief (Google Doc / Notion / modal rules)
+    rather than as an anchor on the Whop modal, BEFORE the no-footage derank is trusted.
+
+    For each footage-less scraped campaign: scan the already-captured brief text for a public footage
+    URL; if none and doc_footage_fetch, fetch the gdoc/Notion page once (URL-preserving) and re-scan.
+    Any footage URL found is appended to source_links (provenance in doc_sourced_footage) and
+    footage_presence + its factor are re-resolved, so the campaign is no longer wrongly deranked and
+    intake/liveness then probe the REAL link (a private/dead one is still caught downstream).
+    Off-Whop, cached (doc_footage_checked), fail-open — never raises. Returns (recovered, links_added).
+    """
+    if not getattr(cfg, "doc_footage_enabled", True):
+        return 0, 0
+    recovered = links_added = 0
+    for rec in records:
+        if rec.get("status") not in ("scraped", "refreshed"):
+            continue
+        # only footage-LESS campaigns are candidates (has-footage/undeterminable -> leave alone)
+        if (rec.get("footage_presence") or {}).get("has_public_footage") is not False:
+            continue
+        found = _footage_urls_from_text(_doc_footage_text(rec))
+        # nothing in stored text -> fetch the gdoc/Notion page once (URL-preserving) and re-scan
+        if not found and getattr(cfg, "doc_footage_fetch", True) and not rec.get("doc_footage_checked"):
+            docs = _rules_gdoc_links(rec.get("resource_links")) + \
+                _rules_notion_links(rec.get("resource_links"))
+            for d in docs:
+                raw = _fetch_raw_for_footage(d.get("url"))
+                if raw:
+                    found = _footage_urls_from_text(raw)
+                if found:
+                    break
+            rec["doc_footage_checked"] = True
+        if not found:
+            continue
+        existing = rec.get("source_links") or []
+        seen = set(existing)
+        new = [u for u in found if u not in seen]
+        if not new:
+            continue
+        rec["source_links"] = existing + new
+        rec["doc_sourced_footage"] = (rec.get("doc_sourced_footage") or []) + new
+        links_added += len(new)
+        # re-resolve footage presence + factor now that footage exists (mirrors enrich_active)
+        fpres = intake_mod.footage_presence(rec)
+        rec["footage_presence"] = fpres
+        rec["footage_presence_factor"] = (cfg.no_footage_penalty
+                                          if fpres.get("has_public_footage") is False else 1.0)
+        if fpres.get("has_public_footage") is True:
+            recovered += 1
+    if recovered or links_added:
+        print(f"  Doc-sourced footage: recovered {recovered} campaign(s) "
+              f"({links_added} footage link(s) mined from briefs) — no-footage derank lifted")
+    return recovered, links_added
+
+
 def resolve_rules_readability(rec, fetch=True):
     """Decide where a campaign's rules are readable FROM, and flag it rules_unreadable when
     they are ONLY in a source we can't read (Notion that won't fetch). Sets: rules_source
@@ -2492,6 +2625,12 @@ def rescore_offline(cfg):
              rec["category_source"], rec["category_confidence"]) = saved_cat
         rec["pre_score"] = pre_score(rec)
 
+    # DOC-SOURCED footage recovery over STORED text only (fetch disabled — rescore is offline):
+    # mine footage URLs already sitting in captured brief text into source_links and lift the
+    # no-footage derank, so a scoring rescore recovers those without a re-scrape. The on-demand
+    # gdoc/Notion fetch is skipped here (network); a normal run does that.
+    enrich_doc_footage(all_records, dataclass_replace(cfg, doc_footage_fetch=False))
+
     # Strategic signals over the FULL list (recurring-creator counts span all history), then
     # recompute composites — mirrors assemble's scoring loop; statuses/exclusions are unchanged.
     strategic_mod.compute_strategic_signals(all_records)
@@ -2648,6 +2787,13 @@ def main():
             # a footage-download pipeline). Bounded, cached, off-Whop, fail-open. Must run AFTER
             # footage_presence (set in enrich_active) so the footage-less gate is available.
             enrich_self_sourced_docs(results, cfg)
+            # DOC-SOURCED footage recovery — Whop often puts the real footage link INSIDE the
+            # linked brief (Google Doc / Notion / modal rules) rather than as a modal anchor, so a
+            # footage-less campaign would be wrongly hit by the no-footage derank AND skipped by
+            # intake/liveness. Mine those briefs for a public footage URL, add it to source_links,
+            # and re-resolve footage_presence — so intake/liveness below probe the REAL link. Must
+            # run AFTER enrich_self_sourced_docs (rules_doc_text populated) and BEFORE intake.
+            enrich_doc_footage(results, cfg)
             # FOOTAGE SUBSTANCE INTAKE — runs FIRST (accessibility is a hard disqualifier,
             # so an undownloadable-footage campaign is sunk before we spend effort on it).
             # Judges what I'd actually be clipping, not just the stats. Cached per campaign.
