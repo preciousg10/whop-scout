@@ -34,6 +34,7 @@ import extract
 import footage as footage_mod
 import categorize as categorize_mod
 import intake as intake_mod
+import lanes as lanes_mod
 import language
 import liveness as liveness_mod
 import proven_clips as clips_mod
@@ -1074,6 +1075,12 @@ def enrich_active(rec, cfg, prev_rec=None, now=None, record_snapshot=True):
     # the brief plus the page CTA (Apply vs Join); an application/selection gate is a hard DQ.
     rec["category"] = extract.classify_category(rec.get("name"), rules, rec.get("platforms"))
     rec["categories"] = extract.classify_categories(rec.get("name"), rules, rec.get("platforms"))
+    # AUDIENCE-LANE tagging (multi-assign) — the topic/audience grouping used for POSTING,
+    # distinct from `category` (a FORMAT). Matches name + category + rules text against the
+    # canonical lane keywords in lanes.py (the same logic scripts/lane_report.py reports on).
+    # Baseline here uses the keyword category; a normal run re-tags after the Groq categorizer
+    # finalizes `category` (tag_lanes), and --rescore re-tags after restoring the stored category.
+    rec["lanes"] = lanes_mod.campaign_lanes(rec)
     rec["open_to_all"] = extract.classify_openness(rules, rec.get("join_cta"))
     rec["disqualifiers"] = extract.detect_disqualifiers(
         rules, rec.get("platforms"), rec.get("source_links"), rec.get("join_cta"))
@@ -2373,6 +2380,17 @@ def update_completed(path, ids, *, remove=False):
     return current
 
 
+def tag_lanes(records):
+    """(Re)compute `rec["lanes"]` for scraped/refreshed records from their FINAL category +
+    text — called after the Groq categorizer overwrites the keyword baseline so a lane like
+    ENTERTAINMENT_STREAMER benefits from the accurate `category` (e.g. podcast_talking). Pure
+    over stored fields; idempotent. Non-active records keep whatever lanes they were persisted
+    with (they're never ranked/clipped)."""
+    for rec in records:
+        if rec.get("status") in ("scraped", "refreshed"):
+            rec["lanes"] = lanes_mod.campaign_lanes(rec)
+
+
 def assemble(results, skipped_records, prev_by_id, seen_ids, completed_ids=None):
     completed_ids = set(completed_ids or [])
     all_records, have = [], set()
@@ -2623,6 +2641,9 @@ def rescore_offline(cfg):
         if had_category:
             (rec["category"], rec["categories"],
              rec["category_source"], rec["category_confidence"]) = saved_cat
+        # Re-tag audience-lanes from the RESTORED (Groq) category, not the keyword baseline
+        # enrich_active just recomputed — so offline lane tagging matches a normal run.
+        rec["lanes"] = lanes_mod.campaign_lanes(rec)
         rec["pre_score"] = pre_score(rec)
 
     # DOC-SOURCED footage recovery over STORED text only (fetch disabled — rescore is offline):
@@ -2816,6 +2837,9 @@ def main():
             # when Groq is unavailable. Ranking (assemble) then buckets by the primary category.
             cat_summary = categorize_mod.categorize_campaigns(
                 results, cfg, recategorize=args.recategorize)
+            # Re-tag audience-lanes now that `category` is the FINAL (Groq) value, not the
+            # keyword baseline enrich_active saw — so lane membership reflects it.
+            tag_lanes(results)
         except StopRun as e:
             stopped_reason = str(e)
             print(f"\n!! STOP: {e}. Saving progress and exiting. Not today — browse manually.")

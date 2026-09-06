@@ -42,7 +42,7 @@ python scout.py --mark-done <campaign-id> [<id> ...]
 python scout.py --unmark-done <campaign-id> [<id> ...]   # restore to the board
 
 # syntax check all modules
-python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py language.py liveness.py
+python -m py_compile scout.py pacing.py browser.py state.py extract.py scoring.py footage.py social.py report.py selectors.py proven_clips.py intake.py strategic.py language.py liveness.py lanes.py
 
 # probe a campaign's footage substance directly (accessibility/type/volume/density)
 python intake.py https://www.youtube.com/watch?v=<id> https://drive.google.com/drive/folders/<id>
@@ -474,6 +474,19 @@ Key module responsibilities:
   reusability. `compute_strategic_signals` runs in `assemble` before scoring. Pure math +
   factors live in `scoring.py`. The `my_performance.json` (user-maintained ground truth of
   my real results) + `scoring.performance_factor` are the unbuilt learning hook.
+- **`lanes.py`** — canonical AUDIENCE-LANE definitions + matcher. A LANE is a TOPIC/AUDIENCE
+  someone follows (HEALTH/FITNESS/MONEY/MOTIVATION_MINDSET/GAMING/ENTERTAINMENT_STREAMER/SPORTS/
+  MUSIC/COMEDY_MEMES/NEWS_POLITICS/FAITH, else OTHER) — the real grouping for POSTING, distinct
+  from a `category` (a FORMAT like podcast/brand_product). Multi-assign: a campaign belongs to
+  EVERY lane whose keywords appear in its name + category + categories + rules/modal text
+  (`match_lanes`, whole-word matched, pure/offline). `enrich_active` persists
+  `rec["lanes"] = lanes.campaign_lanes(rec)` (a baseline on the keyword category); the normal run
+  re-tags via `tag_lanes` AFTER the Groq categorizer finalizes `category`, and `--rescore`
+  re-tags after restoring the stored category — so lane membership reflects the accurate category
+  (e.g. `podcast_talking` → the "podcast" keyword fires ENTERTAINMENT_STREAMER). The SAME module
+  backs `scripts/lane_report.py` (the read-only lane analysis report), so the stored tags never
+  drift from what that report shows. The clipper's `pickcampaign.py --lane` filters its ranked
+  walk on this persisted `lanes` list (the preferred narrow, composes with `--category`).
 - **`language.py`** — offline, Groq-free language detector for the non-English derank (see
   the "Non-English derank" note above). Non-Latin-script check + English-vs-es/pt/fr
   stopword-ratio heuristic; `detect_language` fails OPEN on short/ambiguous text. Pure/testable,

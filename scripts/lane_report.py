@@ -16,7 +16,6 @@ Does NOT modify campaigns.json or any pipeline code — pure read + print.
 """
 
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -27,80 +26,13 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+# The lane keywords + matcher live in scout's canonical `lanes` module (scout also
+# persists `lanes` on each campaign from the SAME logic). Import them so this report and
+# scout's stored tags never drift apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from lanes import LANES, campaign_text, match_lanes  # noqa: E402
+
 CAMPAIGNS_JSON = Path(r"C:\whop\scout\campaigns.json")
-
-# Lane -> keyword phrases. Matched as whole-word/phrase substrings against a
-# campaign's name + category + rules text. A campaign is assigned to EVERY lane
-# whose keywords appear (multi-assign).
-LANES = {
-    "HEALTH": [
-        "sleep", "supplement", "nutrition", "diet", "wellness", "vitamin",
-        "medical", "doctor", "hormone", "peptide", "longevity", "skin",
-        "derma", "mental health", "therapy", "meditation",
-    ],
-    "FITNESS": [
-        "gym", "workout", "fitness", "muscle", "bodybuilding", "weight loss",
-        "protein", "training", "calisthenics", "athletic performance",
-    ],
-    "MONEY": [
-        "crypto", "bitcoin", "trading", "investing", "finance", "business",
-        "entrepreneur", "hustle", "sales", "ecommerce", "wealth", "startup",
-    ],
-    "MOTIVATION_MINDSET": [
-        "motivation", "mindset", "discipline", "masculinity",
-        "self improvement", "self-improvement", "success", "stoic",
-        "confidence", "dating", "red pill", "redpill",
-    ],
-    "GAMING": [
-        "game", "gaming", "fortnite", "minecraft", "cod", "warzone",
-        "valorant", "roblox", "esports", "gameplay",
-    ],
-    "ENTERTAINMENT_STREAMER": [
-        "streamer", "reaction", "drama", "celebrity", "kai cenat",
-        "ishowspeed", "twitch", "irl", "viral moments", "creator", "podcast",
-    ],
-    "SPORTS": [
-        "nba", "nfl", "soccer", "football", "ufc", "mma", "boxing", "f1",
-        "sports", "athlete", "highlights", "basketball",
-    ],
-    "MUSIC": [
-        "song", "edit", "lyric", "rave", "edm", "rapper", "artist", "album",
-        "remix",
-    ],
-    "COMEDY_MEMES": ["meme", "funny", "comedy", "humor", "skit"],
-    "NEWS_POLITICS": [
-        "news", "politics", "election", "current events", "commentary",
-    ],
-    "FAITH": [
-        "god", "faith", "christian", "islam", "bible", "spiritual", "religion",
-    ],
-}
-
-
-def campaign_text(rec):
-    """Blob of name + category + rules text, lowercased, for keyword matching."""
-    parts = [
-        rec.get("name") or "",
-        rec.get("category") or "",
-        " ".join(rec.get("categories") or []),
-        rec.get("rules_text") or "",
-        rec.get("modal_rules_text") or "",
-        rec.get("modal_requirements_text") or "",
-    ]
-    return " ".join(parts).lower()
-
-
-def match_lanes(rec):
-    """Return the sorted list of lanes this campaign fits (may be empty)."""
-    text = campaign_text(rec)
-    hits = []
-    for lane, keywords in LANES.items():
-        for kw in keywords:
-            # whole-word / phrase boundary match so "cod" doesn't hit "code"
-            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])", text):
-                hits.append(lane)
-                break
-    return hits
 
 
 def is_english(rec):
