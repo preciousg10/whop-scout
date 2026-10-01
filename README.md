@@ -4,6 +4,10 @@ A personal research tool that scrapes **your own** logged-in Whop Content Reward
 campaigns at human pace, once a day, and writes them to a JSON file and a
 readable Markdown summary.
 
+> Companion project: this repo (**whop-scout**) researches and ranks which campaigns are worth
+> clipping for; [**whop-clipper**](https://github.com/preciousg10/whop-clipper) turns the footage
+> from the ones you take on into finished vertical clips.
+
 It is deliberately *not* a crawler. One visible browser window, one tab, low
 volume, erratic human timing, and it **stops the moment anything looks like a
 block or challenge** — degrading to "not today, browse manually" rather than
